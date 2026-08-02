@@ -1,0 +1,4572 @@
+-- ═══════════════════════════════════════════════════
+--  Tower Defense Simulator — Shadow X Hub
+--  ระบบมาโคร: สร้าง / อัด / เล่น
+--
+--  โปรโตคอลของเกม (ได้จากการดักจริง ไม่ได้เดา)
+--  ทุกอย่างวิ่งผ่าน remote สองตัวเท่านั้น:
+--    ReplicatedStorage.RemoteEvent      :FireServer
+--    ReplicatedStorage.RemoteFunction   :InvokeServer
+--  รูปแบบคือ (หมวด, การกระทำ, ...)
+--
+--    RE ("Hotbar",    "Click",       slot)
+--    RE ("Streaming", "SelectTower", ชื่อทาวเวอร์, ชื่อสกิน)
+--    RF ("Troops",    "Place",       {Rotation=CFrame, Position=Vector3}, ชื่อทาวเวอร์)
+--    RF ("Troops",    "Upgrade",     "Set", {Troop=model})
+--    RF ("Troops",    "Target",      "Set", {Troop=model, Target="Last"})
+--    RF ("Troops",    "Sell",        {Troop=model})              ← ไม่มี "Set"
+--    RF ("Troops",    "Abilities",   "Activate", {Troop=model, Name=ชื่อสกิล, Data={}})
+--    RF ("Voting",    "Skip"[, ...])   ← Ready ตอนก่อนเริ่มเกมไม่มีอาร์กิวเมนต์
+--                                         โหวตข้ามเวฟอาจมี จึงอัดของจริงไว้ทั้งหมด
+--
+--  ทาวเวอร์ระบุตัวยังไง
+--    ชื่อโมเดลคือชื่อ "สกิน" (Xmas, Haz3mn) ไม่ใช่ชื่อทาวเวอร์ ใช้ระบุตัวไม่ได้
+--    ชื่อจริงกับตัวระบุอยู่ใน model.TowerReplicator:
+--      @Name ชื่อจริง (Farm)   @UID ไม่ซ้ำทั้งเกม   @Position ตำแหน่ง
+--      @Upgrade ระดับ          @TotalSpent ยอดที่จ่ายไป   @OwnerId เจ้าของ
+--      @TargetingMode โหมดเล็ง (1=First 2=Last 3=Strongest ...)
+--
+--    UID เซิร์ฟเวอร์สร้างตอนวาง มาโครรู้ล่วงหน้าไม่ได้
+--    ทางออก: เก็บเป็น "ลำดับที่วาง" (ref) แล้วตอนเล่นค่อยจับคู่ ref → โมเดลจริง
+--    โดยดูจากตำแหน่งที่เพิ่งวาง
+--
+--  เวฟ / เลือด / เวลา อ่านจาก ReplicatedStorage.State ตรงๆ
+-- ═══════════════════════════════════════════════════
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local HttpService        = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local LocalPlayer = Players.LocalPlayer
+
+--  เกมพาส VIP — ปลดล็อกการเลือกแมพเอง
+--  ไอดีมาจากโมดูลของเกมเอง: Hooks.useVIP คืน useGamepass(10518590)
+local VIP_GAMEPASS = 10518590
+
+--  ประกาศไว้ก่อน เพราะตัวเล่นด้านล่างต้องเรียก WindUI:Notify ตอนโหลดเอาต์ไม่ตรง
+--  แต่ WindUI ถูกโหลดทีหลัง ถ้าไม่ประกาศตรงนี้ ชื่อจะกลายเป็นตัวแปร global ที่เป็น nil
+local WindUI
+
+-- ═══════════════════════════════════════════════════
+--  STATE
+-- ═══════════════════════════════════════════════════
+local recording = false
+local playing   = false
+
+local macro      = nil       -- มาโครที่เลือกอยู่
+local currentName = ""       -- ชื่อมาโครที่เลือกอยู่
+local newName    = "Macro 1" -- ชื่อในช่องสร้างใหม่
+
+local cmdDelay      = 0.50   -- หน่วงระหว่างคำสั่ง
+local actionTimeout = 45     -- ลองซ้ำได้นานสุดกี่วินาทีต่อคำสั่ง แล้วข้าม
+local waveGate      = true   -- รอให้ถึงเวฟก่อนค่อยทำ
+local timedPlay     = false  -- เล่นตามจังหวะเวลาที่อัด แทนที่จะทำทันทีที่เงินพอ
+local abilityTiming = true   -- กดสกิลตามจังหวะในเวฟ แทนที่จะกดตามลำดับคิว
+local autoBuff      = false  -- หมุนบัฟเองไม่รู้จบ แยกจากมาโคร
+local buffKind      = ""     -- หมุนของทาวเวอร์ชนิดไหน เช่น "Commander"
+
+local wantPlay      = false  -- ผู้ใช้เปิดสวิตช์ "เล่นมาโคร" ไว้ไหม (คนละเรื่องกับ playing)
+local autoVote      = false  -- โหวตแมพเองใน IntermissionLobby
+local wantMap       = ""     -- แมพที่ผู้ใช้เลือกไว้ในช่อง Select Map
+local hasVIP        = false  -- มีเกมพาส VIP ไหม (เช็คครั้งเดียวตอนโหลด)
+local autoAgain     = false  -- กด Play Again ให้เองเมื่อเกมจบ
+local walkAround    = false  -- ให้ตัวละครเดินไปยืนตรงจุดที่มาโครวางทาวเวอร์
+local lastWalkTower = nil    -- ชนิดล่าสุดที่เดินไปแล้ว จะได้ไม่เดินซ้ำที่เดิม
+
+--  ประกาศไว้ตรงนี้เพราะตัวเล่นอยู่เหนือส่วน UI แต่ต้องติ๊กช่องนี้ให้เองได้
+--  ตอนมาโครสั่งเปิดหมุนบัฟ ผู้ใช้จะได้เห็นว่ามันเปิดอยู่จริงและกดปิดได้
+local AutoBuffToggle
+
+--  เหตุผลเดียวกัน: ตอนเลือกมาโคร ต้องเด้งช่องเลือกด่านให้ตรงกับด่านของมาโครนั้น
+--  ซึ่ง loadMacro อยู่เหนือส่วน UI มาก
+local MapDropdown
+
+--  สวิตช์บันทึกละเอียดตอนเล่น ไม่มีปุ่มใน UI แก้ที่บรรทัดนี้อย่างเดียว
+--
+--  ปิดแล้วเพราะสองรอบล่าสุดผ่านครบ 142/142 ทุกอย่างที่ไล่ตามมาจบหมด
+--  ปิดไว้จะเร็วขึ้นด้วย — การ print ลง output ของ Roblox ช้ากว่าที่คิดมาก
+--  รอบหนึ่งมีเป็นพันบรรทัด รวมแล้วกินเวลาหลายวินาทีต่อเกม
+--
+--  ปิดตัวนี้ไม่ได้ทำให้รายงานหาย ปุ่มคัดลอกรายงานยังบอกคำสั่งที่พลาดครบเหมือนเดิม
+--  เพราะรายการนั้นเก็บแยกจากบันทึกละเอียด
+--  เจอปัญหาเมื่อไหร่เปลี่ยนบรรทัดนี้เป็น true แล้วเล่นใหม่หนึ่งรอบ
+--  ไฟล์เต็มไปโผล่ที่ ShadowXHub/TDS/playlog.txt ตอนเล่นจบ
+local debugLog  = false
+local logLines  = {}
+local logStart  = 0
+local failLog   = {}        -- เฉพาะคำสั่งที่ไม่สำเร็จ เอาไว้สรุปท้ายไฟล์
+local lastReply = ""        -- คำตอบล่าสุดจากเซิร์ฟเวอร์ตอนสั่งวาง
+
+--  ลิมิตจำนวนทาวเวอร์ต่อชนิด เรียนรู้จากข้อความที่เซิร์ฟเวอร์ตอบกลับมาเอง
+--  เช่น "You can only place 10 Farm(s)!" → towerLimit["Farm"] = 10
+--  ไม่ได้ฝังตัวเลขไว้ในโค้ด เพราะลิมิตต่างกันตามทาวเวอร์และเกมอัปเดตได้
+local towerLimit = {}
+
+local status    = ""
+local lastError = ""
+local loadoutMsg = ""
+
+--  ref = ลำดับทาวเวอร์ที่วางในมาโคร  ↔  โมเดลจริงในเกม
+local refModel     = {}
+local modelRef     = {}
+local deadRef      = {}      -- ref ที่วางไม่สำเร็จและตามหาไม่เจอ
+local refPos       = {}      -- ตำแหน่ง/ชนิดที่อัดไว้ของแต่ละ ref ใช้ตามหาทีหลัง
+local refCount     = 0
+--  คิวคำสั่งวางที่ยังรอทาวเวอร์โผล่ — เป็นคิว ไม่ใช่ช่องเดียว
+--  ของเดิมเก็บได้ทีละใบ วางรัวสองใบติดกันใบแรกจะถูกทับแล้วไม่มีวันผูกกับ ref
+local pendingPlaces = {}
+
+--  hotbar slot / สกิน ที่กดล่าสุด เอาไว้เติมให้ action วางที่ตามมา
+local lastSlot, lastSkin = nil, nil
+
+local MACRO_DIR = "ShadowXHub/TDS"
+
+--  ประกาศล่วงหน้า ตัวเฝ้าจบเกมอยู่เหนือส่วน UI แต่ต้องปิดสวิตช์ให้ได้
+local RecordToggle
+
+--  Enum.TargetingMode ของเกม — ใช้แปลงชื่อโหมดกลับเป็นตัวเลขตอนตรวจผล
+local TARGET_NUM = {
+    First = 1, Last = 2, Strongest = 3, Weakest = 4,
+    Closest = 5, Farthest = 6, Random = 7,
+}
+
+-- ═══════════════════════════════════════════════════
+--  ภาษาของข้อความที่สร้างตอนรัน
+--
+--  ระบบ loc: ของ WindUI ใช้ได้เฉพาะข้อความที่ใส่ตอนสร้าง element
+--  แต่สถานะกับข้อความแจ้งเตือนถูกประกอบขึ้นระหว่างเล่น จึงต้องมีตารางของตัวเอง
+--
+--  WindUI ตรวจภาษาผู้เล่นให้เองอยู่แล้ว และห้ามเรียก WindUI:SetLanguage()
+--  เพราะเอกสารระบุว่าการเรียกจะปิดการตรวจอัตโนมัติทิ้ง
+--  ที่นี่จึงอ่าน locale ตรงๆ ด้วยเกณฑ์เดียวกัน: ไทย → ไทย, นอกนั้น → อังกฤษ
+-- ═══════════════════════════════════════════════════
+local LANG = "en"
+do
+    local ok, id = pcall(function()
+        return game:GetService("LocalizationService").RobloxLocaleId
+    end)
+    if ok and type(id) == "string" and id:lower():sub(1, 2) == "th" then
+        LANG = "th"
+    end
+end
+
+local MSG = {
+    en = {
+        READY_IN     = "Ready — in a match",
+        READY_WAIT   = "Waiting to enter a match",
+        WAIT_MAP     = "Wrong map — this macro is for %s, you are on %s. Waiting.",
+        NO_FILE      = "Macro file not found",
+        BAD_FILE     = "Macro file is corrupted",
+        SELECTED     = "Selected: %s · %d commands · map %s%s",
+        USES         = " · uses %s",
+        DELETED      = "Deleted: %s",
+        DEL_FAIL     = "Delete failed",
+        PLAYING_STOP = "Playing right now — turn it off first",
+        NOT_IN_GAME  = "Not in a match yet",
+        PICK_FIRST   = "Create or select a macro first",
+        RECORDING    = "Recording — just play normally",
+        REC_DONE     = "Recorded %d commands · saved to %s",
+        REC_NOSAVE   = "Recorded, but saving failed",
+        REC_STOP     = "Recording right now — turn it off first",
+        NEED_CMDS    = "Select a macro that has commands",
+        EMPTY_MACRO  = "This macro has no commands",
+        STOPPED      = "Stopped",
+        WAIT_WAVE    = "[%d/%d] waiting for wave %d — now wave %d",
+        WAIT_CASH    = "[%d/%d] waiting for $%d — have $%d",
+        DOING        = "[%d/%d] %s%s",
+        ATTEMPT      = "  attempt %d",
+        DONE_ALL     = "Finished all %d commands",
+        DONE_SKIP    = "Finished — skipped %d commands",
+        WAIT_MATCH   = " · waiting for a new match",
+        SKIPPED      = "Skipped command %d (%s) — timed out after %ds",
+        NO_MACRO     = "No macro selected",
+        NO_LOADOUT   = "This macro has no saved loadout — skipping the check",
+        CANT_READ_LO = "Cannot read the current loadout — skipping the check",
+        SLOT_DIFF    = "Slot %s: recorded $%s%s → now %s",
+        EMPTY_SLOT   = "empty",
+        LO_OK        = "✓ Loadout matches the recording",
+        LO_BAD       = "⚠ Loadout does not match",
+        STATS        = "%s\n\nWave %d   Cash %s   Health %d/%d   Towers %d\nMacro: %s (%d commands)%s%s",
+        NO_CASH_READ = "unreadable",
+        NONE_SEL     = "none selected",
+        BUSY         = "Turn off recording / playing first",
+        BUSY_SWITCH  = "Turn off recording / playing before switching macro",
+        NAME_TAKEN   = "A macro named %s already exists — pick another name",
+        CREATE_FAIL  = "Could not create the macro",
+        CREATED      = "Created: %s — you can turn on Record now",
+        EMPTY_LIST   = "— no macros yet —",
+        AUTO_WON     = "Match won — recording stopped and saved (%d commands)",
+        AUTO_LOST    = "Match lost — recording stopped and saved (%d commands)",
+        AUTO_LEFT    = "Left the match — recording stopped and saved (%d commands)",
+        WAIT_CD      = "[%d/%d] tower on cooldown — %ds left",
+        SKIPPED_DEP  = "Skipped command %d (%s) — its tower was never placed",
+        SKIP_NOMOVE  = "Sent the skip vote on wave %d — the wave did not advance, moving on",
+        WAIT_TIME    = "[%d/%d] waiting %.1fs to match the recording",
+        AUTO_TITLE   = "Recording stopped",
+        RE_TITLE     = "Record over this macro?",
+        RE_BODY      = "\"%s\" already holds %d commands.\nRecording again erases all of them — this cannot be undone.",
+        BTN_CANCEL   = "Cancel",
+        BTN_REC      = "Record over it",
+
+        A_PLACE   = "Place tower",
+        A_UPGRADE = "Upgrade",
+        A_TARGET  = "Change targeting",
+        A_SELL    = "Sell",
+        A_ABILITY = "Use ability",
+        A_SKIP    = "Skip wave",
+        A_OPTION  = "Set option",
+        PLACE_INFO   = " · %d towers on the field at that moment",
+        CRASH        = "Script error: %s",
+        CRASH_STOP   = "Stopped by a script error — please send this to the script author",
+        REPORT_COPIED = "Copied — %d failed commands (also saved to TDS_report.txt)",
+        REPORT_FAIL   = "Could not copy — see TDS_report.txt or the F9 console",
+        REC_DROPPED   = " · dropped %d the game refused",
+        NO_ABILITY    = "No tower with a free ability found — place a Commander first",
+        AUTOBUFF_ON   = "Rotating %s buff — waits for each buff to actually start and end",
+        AUTOBUFF_OFF  = "Buff rotation off",
+        A_READY   = "Vote Ready",
+    },
+    th = {
+        READY_IN     = "พร้อม — เข้าแมพแล้ว",
+        READY_WAIT   = "รอเข้าแมพ",
+        WAIT_MAP     = "ผิดแมพ — มาโครนี้อัดไว้ที่ %s ตอนนี้อยู่ %s กำลังรอ",
+        NO_FILE      = "ไม่เจอไฟล์มาโคร",
+        BAD_FILE     = "ไฟล์มาโครเสียหาย",
+        SELECTED     = "เลือกแล้ว: %s · %d คำสั่ง · แมพ %s%s",
+        USES         = " · ใช้ %s",
+        DELETED      = "ลบแล้ว: %s",
+        DEL_FAIL     = "ลบไม่สำเร็จ",
+        PLAYING_STOP = "กำลังเล่นอยู่ ปิดก่อน",
+        NOT_IN_GAME  = "ยังไม่ได้อยู่ในแมพ",
+        PICK_FIRST   = "สร้างหรือเลือกมาโครก่อน",
+        RECORDING    = "กำลังอัด — เล่นตามปกติได้เลย",
+        REC_DONE     = "อัดเสร็จ %d คำสั่ง · บันทึกลง %s แล้ว",
+        REC_NOSAVE   = "อัดเสร็จแต่บันทึกไม่สำเร็จ",
+        REC_STOP     = "กำลังอัดอยู่ ปิดก่อน",
+        NEED_CMDS    = "เลือกมาโครที่มีคำสั่งก่อน",
+        EMPTY_MACRO  = "มาโครนี้ยังไม่มีคำสั่ง",
+        STOPPED      = "หยุดเล่นแล้ว",
+        WAIT_WAVE    = "[%d/%d] รอเวฟ %d — ตอนนี้เวฟ %d",
+        WAIT_CASH    = "[%d/%d] รอเงิน $%d — มี $%d",
+        DOING        = "[%d/%d] %s%s",
+        ATTEMPT      = "  ลองครั้งที่ %d",
+        DONE_ALL     = "เล่นจบครบ %d คำสั่ง",
+        DONE_SKIP    = "เล่นจบ — ข้ามไป %d คำสั่ง",
+        WAIT_MATCH   = " · รอแมตช์ใหม่",
+        SKIPPED      = "ข้ามคำสั่งที่ %d (%s) — หมดเวลา %d วิ",
+        NO_MACRO     = "ยังไม่ได้เลือกมาโคร",
+        NO_LOADOUT   = "มาโครนี้ไม่ได้เก็บโหลดเอาต์ไว้ — ข้ามการตรวจ",
+        CANT_READ_LO = "อ่านโหลดเอาต์ตอนนี้ไม่ได้ — ข้ามการตรวจ",
+        SLOT_DIFF    = "ช่อง %s: ตอนอัด $%s%s → ตอนนี้ %s",
+        EMPTY_SLOT   = "ว่าง",
+        LO_OK        = "✓ โหลดเอาต์ตรงกับตอนอัด",
+        LO_BAD       = "⚠ โหลดเอาต์ไม่ตรง",
+        STATS        = "%s\n\nเวฟ %d   เงิน %s   เลือด %d/%d   ทาวเวอร์ %d\nมาโคร: %s (%d คำสั่ง)%s%s",
+        NO_CASH_READ = "อ่านไม่ได้",
+        NONE_SEL     = "ยังไม่ได้เลือก",
+        BUSY         = "ปิดการอัด/เล่นก่อน",
+        BUSY_SWITCH  = "ปิดการอัด/เล่นก่อนค่อยเปลี่ยนมาโคร",
+        NAME_TAKEN   = "มีมาโครชื่อ %s อยู่แล้ว ตั้งชื่ออื่นครับ",
+        CREATE_FAIL  = "สร้างไม่สำเร็จ",
+        CREATED      = "สร้างแล้ว: %s — เปิดสวิตช์อัดได้เลย",
+        EMPTY_LIST   = "— ยังไม่มีมาโคร —",
+        AUTO_WON     = "ชนะแล้ว — ปิดการอัดและบันทึกให้แล้ว (%d คำสั่ง)",
+        AUTO_LOST    = "แพ้แล้ว — ปิดการอัดและบันทึกให้แล้ว (%d คำสั่ง)",
+        AUTO_LEFT    = "ออกจากแมพแล้ว — ปิดการอัดและบันทึกให้แล้ว (%d คำสั่ง)",
+        WAIT_CD      = "[%d/%d] ทาวเวอร์ติดคูลดาวน์ — เหลือ %d วิ",
+        SKIPPED_DEP  = "ข้ามคำสั่งที่ %d (%s) — ทาวเวอร์ที่อ้างถึงวางไม่สำเร็จ",
+        SKIP_NOMOVE  = "ส่งโหวต skip ที่เวฟ %d แล้ว เวฟไม่ขยับ ข้ามไปทำคำสั่งถัดไป",
+        WAIT_TIME    = "[%d/%d] รออีก %.1f วิ ให้ตรงกับตอนอัด",
+        AUTO_TITLE   = "ปิดการอัดแล้ว",
+        RE_TITLE     = "อัดทับมาโครนี้?",
+        RE_BODY      = "\"%s\" มี %d คำสั่งอยู่แล้ว\nการอัดใหม่จะลบทั้งหมดทิ้ง กู้คืนไม่ได้",
+        BTN_CANCEL   = "ยกเลิก",
+        BTN_REC      = "อัดทับเลย",
+
+        A_PLACE   = "วางทาวเวอร์",
+        A_UPGRADE = "อัปเกรด",
+        A_TARGET  = "เปลี่ยนโหมดเล็ง",
+        A_SELL    = "ขาย",
+        A_ABILITY = "ใช้สกิล",
+        A_SKIP    = "ข้ามเวฟ",
+        A_OPTION  = "ตั้งค่าตัวเลือก",
+        PLACE_INFO   = " · ตอนนั้นมีทาวเวอร์ในสนาม %d ตัว",
+        CRASH        = "สคริปต์ผิดพลาด: %s",
+        CRASH_STOP   = "หยุดเพราะสคริปต์ผิดพลาด — รบกวนส่งข้อความนี้ให้คนทำสคริปต์",
+        REPORT_COPIED = "คัดลอกแล้ว — พลาด %d คำสั่ง (เก็บไว้ที่ TDS_report.txt ด้วย)",
+        REPORT_FAIL   = "คัดลอกไม่ได้ — ดูที่ TDS_report.txt หรือ console F9",
+        REC_DROPPED   = " · ถอดออก %d คำสั่งที่เกมไม่รับ",
+        NO_ABILITY    = "ไม่เจอทาวเวอร์ที่มีสกิลแบบไม่เสียเงิน — วาง Commander ก่อนครับ",
+        AUTOBUFF_ON   = "หมุนบัฟ %s แล้ว — รอให้บัฟขึ้นจริงและหมดจริงทุกครั้ง",
+        AUTOBUFF_OFF  = "ปิดหมุนบัฟแล้ว",
+        A_READY   = "กด Ready",
+    },
+}
+
+--  ถ้าคีย์ไหนขาดในภาษานั้น ตกลงมาที่อังกฤษ ไม่ปล่อยให้ข้อความหาย
+local function T(key, ...)
+    local s = (MSG[LANG] and MSG[LANG][key]) or MSG.en[key] or key
+    if select("#", ...) == 0 then return s end
+    local ok, out = pcall(string.format, s, ...)
+    return ok and out or s
+end
+
+--  ปุ่ม Vote Ready กับ Skip Wave ส่งคำสั่งเดียวกันเป๊ะ (RF "Voting","Skip")
+--  แยกจากตัวคำสั่งไม่ได้ ดูได้จากเวฟอย่างเดียว — เวฟ 0 คือหน้าก่อนเริ่มเกม
+local ACT_KEY = {
+    place = "A_PLACE", upgrade = "A_UPGRADE", target = "A_TARGET",
+    sell  = "A_SELL",  ability = "A_ABILITY", skip   = "A_SKIP",
+    option = "A_OPTION",
+}
+
+local function actionLabel(a)
+    if a.type == "skip" and (a.wave or 0) <= 0 then return T("A_READY") end
+    local k = ACT_KEY[a.type]
+    return k and T(k) or a.type
+end
+
+--  บันทึกละเอียดตอนเล่น — ปิดไว้จะไม่เสียอะไรเลย แค่ return ทันที
+local function dlog(fmt, ...)
+    if not debugLog then return end
+    local ok, s = pcall(string.format, fmt, ...)
+    if not ok then s = tostring(fmt) end
+
+    local line = ("[%7.2f] %s"):format(os.clock() - logStart, s)
+    table.insert(logLines, line)
+    if #logLines > 5000 then table.remove(logLines, 1) end
+
+    --  พิมพ์ออก console ด้วย เปิด F9 ดูสดๆ ได้โดยไม่ต้องรอจบรอบ
+    --  เก็บไว้ในหน่วยความจำอย่างเดียวแปลว่าถ้าเกมค้างหรือหลุด ข้อมูลหายหมด
+    print("[TDS] " .. line)
+end
+
+--  บันทึกของฝั่งโหวตแมพ — พิมพ์เสมอ ไม่ขึ้นกับสวิตช์ debugLog
+--
+--  ส่วนนี้ทำงานนานๆ ครั้งและมีไม่กี่บรรทัด การพิมพ์ตลอดจึงไม่หนัก
+--  แต่ประโยชน์เยอะมาก: รอบที่แล้ว "ไม่มีอะไรเกิดขึ้นเลย" แล้วเราแยกไม่ออกว่า
+--  สวิตช์ไม่ติด ลูปไม่เริ่ม หรือลูปเริ่มแล้วแต่ออกที่เงื่อนไขไหน
+--  พิมพ์เฉพาะตอนข้อความเปลี่ยน จะได้ไม่ท่วมจากลูปที่วนทุกสองวินาที
+local lastVoteMsg = nil
+
+local function vlog(fmt, ...)
+    local ok, s = pcall(string.format, fmt, ...)
+    if not ok then s = tostring(fmt) end
+    if s == lastVoteMsg then return end
+    lastVoteMsg = s
+
+    print("[TDS/vote] " .. s)
+    if debugLog then
+        table.insert(logLines, ("[%7.2f] โหวตแมพ: %s"):format(os.clock() - logStart, s))
+    end
+end
+
+--  สรุปเฉพาะคำสั่งที่พลาด เอาไว้ก๊อปส่งให้คนแก้สคริปต์
+--  แยกจาก logLines ทั้งก้อนเพราะ 800 บรรทัดไม่มีใครอยากอ่าน
+local function failSummary()
+    if #failLog == 0 then
+        return "รอบล่าสุด: ไม่มีคำสั่งไหนพลาดเลย"
+    end
+    local out = { ("รอบล่าสุด: ไม่สำเร็จ %d คำสั่ง"):format(#failLog), "" }
+    for _, line in ipairs(failLog) do
+        table.insert(out, line)
+        table.insert(out, "")
+    end
+    return table.concat(out, "\n")
+end
+
+-- ═══════════════════════════════════════════════════
+--  GAME REFS
+-- ═══════════════════════════════════════════════════
+local RE = ReplicatedStorage:FindFirstChild("RemoteEvent")
+local RF = ReplicatedStorage:FindFirstChild("RemoteFunction")
+
+local function gameState()  return ReplicatedStorage:FindFirstChild("State") end
+local function towersFolder() return workspace:FindFirstChild("Towers") end
+
+--  ห้องเลือกด่านก่อนเข้าเกมจริง (คนละที่กับล็อบบี้หลัก)
+--  อยู่ตรงนี้ = ยังไม่ได้เริ่มเล่น แต่ก็ไม่ใช่ "หลุดออกจากเกม"
+local function lobbyFolder()
+    return workspace:FindFirstChild("IntermissionLobby")
+end
+
+local function inLobby()
+    return lobbyFolder() ~= nil
+end
+
+--  อยู่ในด่านจริงแล้วหรือยัง
+--
+--  ⚠ ต้องเช็ค IntermissionLobby ด้วย ห้ามดูแค่ State กับ Towers
+--
+--  ยืนยันจาก log จริง: ตอนยืนอยู่หน้า "Vote For A Map" ฟังก์ชันนี้ตอบว่าจริง
+--  ทั้งสองอย่างนั้นมีอยู่ในห้องเลือกด่านด้วย ไม่ได้มีเฉพาะตอนเล่น
+--  ผลคือระบบโหวตแมพคิดว่าเข้าด่านไปแล้วตั้งแต่วินาทีแรก เลยไม่ทำอะไรเลยทั้งรอบ
+--  และตัวเล่นมาโครก็เกือบจะเริ่มยิงคำสั่งทั้งที่ยังไม่ได้เข้าด่าน
+--
+--  ทั้งสองอย่างมีอยู่พร้อมกันไม่ได้ — ถ้ายังเห็นห้องเลือกด่าน แปลว่ายังไม่ได้เริ่ม
+local function inGame()
+    return gameState() ~= nil and towersFolder() ~= nil
+        and RE ~= nil and RF ~= nil
+        and not inLobby()
+end
+
+--  รายชื่อแมพทั้งหมดที่เกมมี
+--
+--  อ่านจาก ReplicatedStorage.Content.Maps ซึ่งเป็นที่เดียวกับที่โมดูล NewMaps ของเกมใช้
+--  (require(Shared.Modules.Content)("Maps")) จึงได้ชื่อตรงกับที่เกมรู้จักเสมอ
+--  ไม่ต้อง require ตัวแมพ เพราะแค่ต้องการชื่อ และการ require ทุกแมพกินเวลานาน
+local function listMapNames()
+    local out = {}
+    pcall(function()
+        local content = ReplicatedStorage:FindFirstChild("Content")
+        local maps    = content and content:FindFirstChild("Maps")
+        if not maps then return end
+        for _, m in ipairs(maps:GetChildren()) do
+            table.insert(out, m.Name)
+        end
+    end)
+    table.sort(out)
+    if #out == 0 then table.insert(out, "— no maps found —") end
+    return out
+end
+
+-- ── การเดินของตัวละคร ───────────────────────────────────
+--
+--  ใช้สองที่: เดินไปโหวตแมพ กับ Walk Around ตอนวางทาวเวอร์
+--  จึงต้องประกาศไว้เหนือทั้งสองส่วน
+local function myHumanoid()
+    local ch = LocalPlayer.Character
+    if not ch then return nil, nil end
+    return ch:FindFirstChildOfClass("Humanoid"), ch
+end
+
+--  เดินไปให้ใกล้พอที่ ProximityPrompt จะยอมรับ
+--
+--  ยิง fireproximityprompt จากที่ไกลๆ ได้ในบาง executer แต่ไม่ใช่ทุกตัว
+--  และฝั่งเซิร์ฟเวอร์ก็ตรวจระยะซ้ำอีกชั้น เดินไปจริงจึงชัวร์กว่า
+--  ตอนอยู่ในห้องเลือกด่านไม่มีอะไรให้เสีย เดินได้เต็มที่
+local function walkTo(where, timeout)
+    local pos
+    if typeof(where) == "Vector3" then
+        pos = where
+    elseif typeof(where) == "Instance" then
+        if where:IsA("BasePart") then
+            pos = where.Position
+        elseif where:IsA("Attachment") then
+            pos = where.WorldPosition
+        elseif where:IsA("Model") then
+            local ok, pv = pcall(function() return where:GetPivot().Position end)
+            pos = ok and pv or nil
+        end
+    end
+    if not pos then return false end
+
+    local until_ = os.clock() + (timeout or 20)
+    while os.clock() < until_ do
+        local hum, ch = myHumanoid()
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not (hum and root) then task.wait(0.5)
+        else
+            if (root.Position - pos).Magnitude <= 6 then return true end
+            hum:MoveTo(pos)
+            task.wait(0.3)
+        end
+    end
+    return false
+end
+
+
+-- ═══════════════════════════════════════════════════
+--  อ่านสถานะเกม
+-- ═══════════════════════════════════════════════════
+--  State.Wave ค้างอยู่ที่ 0 ตลอดทั้งเกม — ยืนยันด้วย log จริง: จับตอนวินาทีที่ 240
+--  หลังเล่นจบ 20 เวฟ ยังอ่านได้ 0 อยู่ดี เกมไม่ได้ใช้ค่านี้
+--  เลขเวฟจริงมีที่เดียวคือแถบบนจอ รูปแบบ "3 / 20" เอาตัวเลขตัวแรก
+--
+--  นี่คือเหตุผลที่ "รอตามเวฟ" ไม่เคยทำงาน และทำไม skip บางเวฟถึงไม่กด
+local waveLabel = nil
+local lastWaveText = nil       -- ข้อความดิบบนแถบ เอาไว้ตรวจว่าอ่านถูกไหม
+
+--  เส้นทางตายตัว Frame.wave.value ที่เคยเขียนไว้หาไม่เจอเลยสักครั้ง
+--  (log จริงขึ้น raw=nil ทุกบรรทัด) React ซ้อนกล่องลึกกว่านั้นและเปลี่ยนได้ทุกอัปเดต
+--  จึงต้องค้นแบบไล่ลูกหลานแทนการเดินตามชื่อทีละชั้น
+local function findWaveLabel()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local top = gui and gui:FindFirstChild("ReactGameTopGameDisplay")
+    if not top then return nil end
+
+    --  เส้นทางจริงจากซอร์สของคอมโพเนนต์ Wave: Frame > wave > container > value
+    --  ที่ผมเคยเขียนไว้ขาด container ไปหนึ่งชั้น เลยหาไม่เจอสักครั้ง
+    local f = top:FindFirstChild("Frame")
+    local w = f and f:FindFirstChild("wave")
+    local c = w and w:FindFirstChild("container")
+    local v = c and c:FindFirstChild("value")
+    if v and v:IsA("TextLabel") then return v end
+
+    --  สำรอง 1: ค้นลึก เผื่อเกมขยับชั้นในอัปเดตหน้า
+    local box = top:FindFirstChild("wave", true)
+    v = box and box:FindFirstChild("value", true)
+    if v and v:IsA("TextLabel") then return v end
+
+    --  ทางสำรอง: เกาะป้ายที่เขียนว่า "Wave:" แล้วหยิบตัวเลขในกล่องเดียวกัน
+    --  ต้องเกาะป้ายนี้ ไม่ใช่จับรูปแบบ "%d / %d" ลอยๆ เพราะเลือดก็หน้าตาเหมือนกัน
+    for _, d in ipairs(top:GetDescendants()) do
+        if d:IsA("TextLabel") and (d.Text or ""):lower():find("^wave") then
+            local p = d.Parent
+            if p then
+                for _, s in ipairs(p:GetDescendants()) do
+                    if s:IsA("TextLabel") and s ~= d and s.Text:match("%d") then
+                        return s
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local lastWaveNum = nil        -- เลขที่อ่านได้ล่าสุด ใช้ตอนป้ายอ่านไม่ได้ชั่วคราว
+
+local function getWave()
+    if not (waveLabel and waveLabel.Parent) then
+        waveLabel = findWaveLabel()
+    end
+
+    if waveLabel then
+        lastWaveText = waveLabel.Text
+        local n = tonumber(lastWaveText:match("%d+"))
+        if n then
+            lastWaveNum = n
+            return n
+        end
+    else
+        lastWaveText = nil
+    end
+
+    --  ป้ายอ่านเป็นตัวเลขไม่ได้ชั่วคราว ซอร์สของเกมเขียนไว้ว่ามีสามกรณี:
+    --    "∞" เมื่อเวฟเป็น -1 หรือเกิน 90000
+    --    "--" เมื่อยังไม่รู้จำนวนเวฟ
+    --    เวฟซ่อน จะเปลี่ยน value เป็น Frame ที่มี "???" ไม่ใช่ TextLabel ด้วยซ้ำ
+    --  คืนค่าล่าสุดที่อ่านได้ ดีกว่าคืน 0 ซึ่งจะทำให้ประตูเวฟเปิดหมดทุกคำสั่ง
+    if lastWaveNum then return lastWaveNum end
+
+    local s = gameState()
+    local w = s and s:FindFirstChild("Wave")
+    return (w and w.Value) or 0
+end
+
+--  เวฟสุดท้ายของแมพนี้คือเวฟที่เท่าไหร่
+--
+--  ป้ายเขียนว่า "19 / 20" ตัวหลังคือจำนวนเวฟทั้งหมด อ่านตรงนั้นได้เลย
+--  จำค่าไว้ด้วยเพราะช่วงก่อนเริ่มเกมป้ายเป็น "--" ซึ่งไม่มีเลขให้อ่าน
+--  โหมดไม่รู้จบ (∞) จะไม่มีตัวหลัง ก็คืน nil ไป ตัวเรียกต้องรับมือเอง
+local lastWaveMax = nil
+
+local function getWaveMax()
+    if lastWaveText then
+        local mx = tonumber(tostring(lastWaveText):match("/%s*(%d+)"))
+        if mx and mx > 0 then lastWaveMax = mx end
+    end
+    return lastWaveMax
+end
+
+local function getHealth()
+    local s = gameState()
+    local h = s and s:FindFirstChild("Health")
+    local c = h and h:FindFirstChild("Current")
+    local m = h and h:FindFirstChild("Max")
+    return (c and c.Value) or 0, (m and m.Value) or 0
+end
+
+--  ตอนนี้อยู่แมพอะไร
+--
+--  อ่านสองที่ เพราะสองที่นี้มาถึงไม่พร้อมกันตอนแมพเพิ่งโหลด
+--    State.Map              ค่าที่มาโครใช้เก็บตอนอัด
+--    workspace:GetAttribute("Map")  ตัวที่โมดูล ClientMapController ของเกมใช้เอง
+--  เอาอันไหนก็ได้ที่อ่านได้ก่อน ดีกว่าคืน "?" แล้วปล่อยให้ด่านผิดหลุดผ่าน
+local function getMapName()
+    local s = gameState()
+    local m = s and s:FindFirstChild("Map")
+    local v = m and m.Value
+    if type(v) == "string" and v ~= "" then return v end
+
+    local a = workspace:GetAttribute("Map")
+    if type(a) == "string" and a ~= "" then return a end
+
+    return "?"
+end
+
+local function getDifficulty()
+    local s = gameState()
+    local d = s and s:FindFirstChild("Difficulty")
+    return (d and d.Value) or "?"
+end
+
+--  เงินในเกมไม่ได้อยู่ที่ LocalPlayer.Cash — ตรงนั้นอ่านได้ 0 ตลอด
+--  ทั้งที่บนจอโชว์ $612 ตัวเลขบน hotbar เป็นที่เดียวที่เชื่อได้ตอนนี้
+--  จึงต้องอ่านจากข้อความ ซึ่งเป็นจุดเปราะจุดเดียวของสคริปต์นี้
+--  ถ้าเกมแก้ UI ตรงนี้ "รอเงินพอ" จะไม่ทำงาน แต่ส่วนอื่นยังรอด
+--  เพราะทุกคำสั่งมีการยืนยันผลหลังส่งอยู่แล้ว
+local cashLabel = nil
+
+local function getCash()
+    if cashLabel and cashLabel.Parent then
+        return tonumber((cashLabel.Text:gsub("[^%d]", "")))
+    end
+    cashLabel = nil
+
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local hb  = gui and gui:FindFirstChild("ReactUniversalHotbar")
+    if not hb then return nil end
+
+    for _, d in ipairs(hb:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "amount"
+            and d.Parent and d.Parent.Name == "cash" then
+            cashLabel = d
+            return tonumber((d.Text:gsub("[^%d]", "")))
+        end
+    end
+    return nil
+end
+
+--  ราคาของทาวเวอร์ในแต่ละช่อง hotbar
+--  ใช้เทียบว่าโหลดเอาต์ตอนนี้เหมือนตอนอัดหรือเปล่า — ถ้าช่อง 2 เคยเป็น
+--  Scout ($250) แล้วตอนนี้กลายเป็นของราคาอื่น มาโครจะวางผิดตัวทั้งชุด
+local function hotbarCosts()
+    local gui    = LocalPlayer:FindFirstChild("PlayerGui")
+    local hb     = gui and gui:FindFirstChild("ReactUniversalHotbar")
+    local frame  = hb and hb:FindFirstChild("Frame")
+    local troops = frame and frame:FindFirstChild("troops")
+    if not troops then return nil end
+
+    local out, n = {}, 0
+    for _, slot in ipairs(troops:GetChildren()) do
+        local idx     = tonumber(slot.Name)
+        local content = slot:FindFirstChild("content")
+        local cost    = content and content:FindFirstChild("Cost")
+        if idx and cost and cost:IsA("TextLabel") then
+            out[tostring(idx)] = tonumber((cost.Text:gsub("[^%d]", ""))) or 0
+            n = n + 1
+        end
+    end
+    return n > 0 and out or nil
+end
+
+--  ราคาปัจจุบันกับคูลดาวน์ของช่อง hotbar หนึ่งช่อง
+--
+--  ราคาที่อัดไว้กับราคาตอนเล่นไม่จำเป็นต้องเท่ากัน — บัฟส่วนลด, State.PriceScale
+--  และโหมดพิเศษทำให้เปลี่ยนได้ ราคาสดจากช่องจึงแม่นกว่าเสมอ
+--
+--  Timeleft คือคูลดาวน์วางทาวเวอร์ ถ้ายังไม่ถึง 0 ยิงไปก็โดนปฏิเสธแน่นอน
+--  อันนี้แหละคือสาเหตุใหญ่ที่ "วางไม่สำเร็จ" — ไม่ใช่เงินไม่พอ
+local function slotInfo(slot)
+    if not slot then return nil end
+    local gui    = LocalPlayer:FindFirstChild("PlayerGui")
+    local hb     = gui and gui:FindFirstChild("ReactUniversalHotbar")
+    local frame  = hb and hb:FindFirstChild("Frame")
+    local troops = frame and frame:FindFirstChild("troops")
+    local s      = troops and troops:FindFirstChild(tostring(slot))
+    local c      = s and s:FindFirstChild("content")
+    if not c then return nil end
+
+    local cost = c:FindFirstChild("Cost")
+    local left = c:FindFirstChild("Timeleft")
+    return {
+        cost     = cost and tonumber((cost.Text:gsub("[^%d]", ""))) or nil,
+        cooldown = left and tonumber((left.Text:gsub("[^%d]", ""))) or 0,
+    }
+end
+
+--  อ่านข้อมูลทาวเวอร์จากโมดูลของเกมเอง
+--
+--  โครงสร้าง: Content.Tower.<ชื่อ>.Stats  →  .Stats.Default.Defaults
+--    Limit      จำนวนสูงสุดที่วางได้
+--    Abilities  รายการสกิล { Name, Level, Debounce, Price? }
+--                 Level    ต้องอัปเกรดถึงระดับนี้ก่อนถึงจะมีสกิล
+--                 Debounce คูลดาวน์ระหว่างการใช้ของทาวเวอร์ตัวเดียวกัน
+--                 Price    มี = สกิลที่ต้องจ่ายเงิน (เช่น Support Caravan 2000฿)
+--
+--  อ่านจากที่นี่ได้ = ไม่ต้องพึ่งมาโคร ไม่ต้องลองผิดลองถูก และไม่ฝังตัวเลขไว้ในโค้ด
+local statsCache = {}
+
+local function towerDefaults(kind)
+    if kind == nil or kind == "" then return nil end
+    if statsCache[kind] ~= nil then return statsCache[kind] or nil end
+
+    local ok, out = pcall(function()
+        local content = ReplicatedStorage:FindFirstChild("Content")
+        local folder  = content and content:FindFirstChild("Tower")
+        local tower   = folder and folder:FindFirstChild(kind)
+        local mod     = tower and tower:FindFirstChild("Stats")
+        if not (mod and mod:IsA("ModuleScript")) then return nil end
+
+        local def = require(mod)
+        if type(def) ~= "table" then return nil end
+        local d = def.Stats and def.Stats.Default
+        return d and d.Defaults or nil
+    end)
+
+    statsCache[kind] = (ok and type(out) == "table") and out or false
+    return statsCache[kind] or nil
+end
+
+--  ตารางราคาอัปเกรดของทาวเวอร์ชนิดนี้
+--
+--  โครงสร้างที่ยืนยันแล้วจาก Debug TDS Range Price:
+--    Content.Tower.<ชื่อ>.Stats  →  .Stats.Default.Upgrades[n].Cost
+--  ช่องที่ n คือราคาของการอัปจาก "ระดับ n-1 ไป n" (ตรวจกับ DJ Booth ครบ 5 ขั้น)
+--
+--  ทาวเวอร์ที่ติด Golden ใช้คนละตาราง — Scout ธรรมดา 50/375/1350/2200
+--  แต่ Scout Golden เป็น 150/600/2400/3600 ต่างกันเกินสามเท่าในบางขั้น
+--  ถ้าหยิบผิดตาราง มาโครจะรอเงินผิดยอดทุกครั้งที่อัปตัวนั้น
+local upgradeCache = {}
+
+local function upgradeCosts(kind, golden)
+    if kind == nil or kind == "" then return nil end
+    local key = kind .. (golden and "|G" or "|D")
+    if upgradeCache[key] ~= nil then return upgradeCache[key] or nil end
+
+    local ok, out = pcall(function()
+        local content = ReplicatedStorage:FindFirstChild("Content")
+        local folder  = content and content:FindFirstChild("Tower")
+        local tower   = folder and folder:FindFirstChild(kind)
+        local mod     = tower and tower:FindFirstChild("Stats")
+        if not (mod and mod:IsA("ModuleScript")) then return nil end
+
+        local def = require(mod)
+        local all = type(def) == "table" and def.Stats
+        if type(all) ~= "table" then return nil end
+
+        --  ไม่มีตาราง Golden ก็ถอยไปใช้ Default ทาวเวอร์ส่วนใหญ่มีตารางเดียว
+        local variant = (golden and all.Golden) or all.Default
+        local ups = variant and variant.Upgrades
+        if type(ups) ~= "table" then return nil end
+
+        local costs = {}
+        for i, u in ipairs(ups) do
+            costs[i] = tonumber(type(u) == "table" and u.Cost) or nil
+        end
+        return next(costs) and costs or nil
+    end)
+
+    upgradeCache[key] = (ok and type(out) == "table") and out or false
+    return upgradeCache[key] or nil
+end
+
+--  สกิลของชนิดนี้ที่ "ไม่เสียเงิน" เรียงตามระดับที่ต้องการ
+--  สกิลที่มี Price คือของที่ต้องจ่าย ไม่ใช่บัฟ วนกดแล้วเผาเงินรอบละหลายพัน
+local function freeAbilities(kind)
+    local d = towerDefaults(kind)
+    local list = d and d.Abilities
+    if type(list) ~= "table" then return {} end
+
+    local out = {}
+    for _, ab in ipairs(list) do
+        if type(ab) == "table" and ab.Name and ab.Price == nil then
+            table.insert(out, {
+                name  = tostring(ab.Name),
+                level = tonumber(ab.Level) or 0,
+            })
+        end
+    end
+    table.sort(out, function(x, y) return x.level < y.level end)
+    return out
+end
+
+--  มีบอสอยู่ในสนามไหม
+--
+--  ทำแบบเดียวกับ hook useBosses ของเกม: ดู ClientAtoms.enemyReplicators
+--  แล้วกรองตัวที่มี Modifiers:Get("Boss") — เป็นแหล่งเดียวกับที่แถบเลือดบอสใช้
+--  จึงตรงกับสิ่งที่ผู้เล่นเห็นบนจอเป๊ะ ไม่ใช่การเดาจากชื่อศัตรูหรือเวลา
+--
+--  ห่อ pcall ทุกชั้นเพราะถ้าเกมอัปเดตแล้วโครงสร้างเปลี่ยน ต้องไม่ลากมาโครล้มไปด้วย
+--  แค่ถอยไปใช้การนับวินาทีแทน ซึ่งยังพอใช้ได้
+local clientAtoms = nil
+
+--  พิกัดของบอสทุกตัวในสนาม
+--
+--  ตัวศัตรูแต่ละตัวมีคีย์ .Model ที่เป็นโมเดลจริงในโลก (ยืนยันจาก Debug TDS Range Price)
+--  อ่าน GetPivot() ของโมเดลนั้นได้พิกัดที่ตรงกับสิ่งที่ตาเห็น
+--  ตารางของศัตรูไม่มีคีย์พิกัดตรงๆ ให้อ่าน ต้องผ่านโมเดลทางเดียว
+local function bossPositions()
+    if clientAtoms == nil then
+        local ok, mod = pcall(function()
+            return require(ReplicatedStorage.Shared.Modules.ClientAtoms)
+        end)
+        clientAtoms = (ok and type(mod) == "table") and mod or false
+    end
+    if not clientAtoms then return {} end
+
+    local ok, out = pcall(function()
+        local atom = clientAtoms.enemyReplicators
+        local reps = (type(atom) == "function") and atom() or atom
+        if type(reps) ~= "table" then return {} end
+
+        local found = {}
+        for _, e in pairs(reps) do
+            local mods = type(e) == "table" and e.Modifiers
+            if mods and type(mods.Get) == "function" and mods:Get("Boss") then
+                local mdl = e.Model
+                if typeof(mdl) == "Instance" and mdl.Parent then
+                    local okP, p = pcall(function()
+                        return mdl:IsA("Model") and mdl:GetPivot().Position or mdl.Position
+                    end)
+                    if okP and typeof(p) == "Vector3" then
+                        table.insert(found, p)
+                    end
+                end
+            end
+        end
+        return found
+    end)
+    return (ok and type(out) == "table") and out or {}
+end
+
+local function bossOnField()
+    if clientAtoms == nil then
+        local ok, mod = pcall(function()
+            return require(ReplicatedStorage.Shared.Modules.ClientAtoms)
+        end)
+        clientAtoms = (ok and type(mod) == "table") and mod or false
+    end
+    if not clientAtoms then return false end
+
+    local ok, found = pcall(function()
+        local atom = clientAtoms.enemyReplicators
+        local reps = (type(atom) == "function") and atom() or atom
+        if type(reps) ~= "table" then return false end
+
+        for _, e in pairs(reps) do
+            local mods = type(e) == "table" and e.Modifiers
+            if mods and type(mods.Get) == "function" and mods:Get("Boss") then
+                return true
+            end
+        end
+        return false
+    end)
+    return ok and found or false
+end
+
+--  เมนูโหวตข้ามเวฟขึ้นหรือยัง
+--
+--  ซอร์สของคอมโพเนนต์ VoteWave เขียนป้ายนับโหวตไว้ว่า "%d/%d Required"
+--  จึงใช้คำนี้เป็นตัวชี้ว่าเมนูโผล่แล้ว ไม่ต้องเดาจากเวลาหรือสถานะอื่น
+--
+--  จำเป็นเพราะการยิงโหวตตอนเมนูยังไม่ขึ้นคือยิงทิ้งเปล่า เซิร์ฟเวอร์ไม่รับ
+--  ซึ่งเป็นสาเหตุที่โหวตของมาโครไม่ติดทั้งที่คำสั่งเหมือนกับตอนกดมือทุกตัวอักษร
+--  เช็ค .Visible อย่างเดียวไม่พอ — VoteWave ไม่ได้ซ่อนเมนูด้วยการตั้ง Visible=false
+--  แต่ใช้ spring เลื่อนตำแหน่งออกนอกจอ (Position.X เป็น scale 2) แล้วให้กล่องแม่
+--  ที่ ClipsDescendants=true ตัดทิ้ง ป้ายจึงมี Visible=true ตลอดเวลา
+--  ต้องดูตำแหน่งจริงบนจอเทียบกับขนาดวิวพอร์ตถึงจะรู้ว่าเมนูโผล่จริงหรือยัง
+local function onScreen(d)
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+
+    local vp   = cam.ViewportSize
+    local pos  = d.AbsolutePosition
+    local size = d.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return false end
+
+    return pos.X + size.X > 0 and pos.X < vp.X
+       and pos.Y + size.Y > 0 and pos.Y < vp.Y
+end
+
+local function shown(d)
+    local node = d
+    while node do
+        if node:IsA("ScreenGui") then return node.Enabled end
+        if node:IsA("GuiObject") and not node.Visible then return false end
+        node = node.Parent
+    end
+    return false
+end
+
+--  อ่านป้ายนับโหวต "0/1 Required" คืนเป็น (โหวตแล้ว, ที่ต้องการ)
+--  คืน nil ถ้าเมนูไม่ได้อยู่บนจอ
+--
+--  ตัวเลขนี้คือตัวยืนยันที่ถูกต้องว่าโหวตของเราติดหรือไม่
+--  ที่ผมเคยใช้ "เลขเวฟขยับ" นั้นผิด เพราะการข้ามช่วงนับถอยหลังทำให้ศัตรูออกเร็วขึ้น
+--  แต่เลขเวฟยังเท่าเดิม จะขึ้นก็ต่อเมื่อเคลียร์เวฟนั้นเสร็จแล้ว
+local function voteCount()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+
+    --  ดูเฉพาะ ScreenGui ที่ชื่อมีคำว่า vote ไม่กวาดทั้ง PlayerGui
+    --  เพราะที่นี่มี ScreenGui เป็นร้อยตัว การกวาดหมดทุกรอบกินแรงเกินจำเป็น
+    for _, g in ipairs(gui:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Name:lower():find("vote") then
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextLabel") and (d.Text or ""):find("Required")
+                    and shown(d) and onScreen(d) then
+                    local now, need = d.Text:match("(%d+)%s*/%s*(%d+)")
+                    return tonumber(now) or 0, tonumber(need) or 0
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function voteMenuOpen()
+    return voteCount() ~= nil
+end
+
+--  สำรวจเมนูโหวตทุกตัวบนจอ ใช้ตอนสืบหาปัญหาเท่านั้น
+--  กวาดทั้ง PlayerGui ซึ่งหนัก จึงเรียกเฉพาะตอนเขียนบันทึก ไม่ได้เรียกทุกเฟรม
+local function voteDump()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return "ไม่มี PlayerGui" end
+
+    local out = {}
+    for _, g in ipairs(gui:GetChildren()) do
+        if g:IsA("ScreenGui") then
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextLabel") and (d.Text or ""):find("Required") then
+                    --  ป้ายหัวข้อในกล่องเดียวกัน เช่น "Skip Wave?"
+                    local title = ""
+                    if d.Parent then
+                        for _, s in ipairs(d.Parent:GetChildren()) do
+                            if s:IsA("TextLabel") and s ~= d and (s.Text or "") ~= "" then
+                                title = s.Text
+                                break
+                            end
+                        end
+                    end
+                    table.insert(out, ("%s = %q | หัวข้อ %q | shown=%s onScreen=%s")
+                        :format(d:GetFullName(), d.Text, title,
+                                tostring(shown(d)), tostring(onScreen(d))))
+                end
+            end
+        end
+    end
+
+    if #out == 0 then return "ไม่เจอป้าย Required เลย" end
+    return table.concat(out, "\n        ")
+end
+
+-- ═══════════════════════════════════════════════════
+--  อ่านข้อมูลทาวเวอร์
+-- ═══════════════════════════════════════════════════
+local function rep(m) return m and m:FindFirstChild("TowerReplicator") end
+
+local function isMine(m)
+    local r = rep(m)
+    return r ~= nil and r:GetAttribute("OwnerId") == LocalPlayer.UserId
+end
+
+--  ชื่อทาวเวอร์จริง เช่น Farm — ต่างจาก m.Name ที่เป็นชื่อสกิน (Xmas, Masquerade)
+--  เคยมีแล้วแต่ถูกลบทิ้งตอนเขียนใหม่ ทั้งที่ยังมีที่เรียกใช้อยู่
+local function tName(m)
+    local r = rep(m)
+    return r and r:GetAttribute("Name")
+end
+
+local function tPos(m)
+    local r = rep(m)
+    return r and r:GetAttribute("Position")
+end
+
+local function tSpent(m)
+    local r = rep(m)
+    return (r and r:GetAttribute("TotalSpent")) or 0
+end
+
+local function tLevel(m)
+    local r = rep(m)
+    return (r and r:GetAttribute("Upgrade")) or 0
+end
+
+local function tTargetMode(m)
+    local r = rep(m)
+    return r and r:GetAttribute("TargetingMode")
+end
+
+--  ระยะโจมตีจริงของทาวเวอร์ตัวนี้ ณ ตอนนี้
+--
+--  @Range เป็นแอตทริบิวต์สดบน TowerReplicator ที่เซิร์ฟเวอร์อัปเดตให้เอง
+--  ตรงกับระดับปัจจุบันอยู่แล้ว ไม่ต้องไปคำนวณจากโมดูลเอง
+--  (ยืนยันแล้ว: DJ Booth ขั้น 2 ได้ 15 · ขั้น 5 ได้ 18 ตรงกับตารางในโมดูลเป๊ะ)
+--
+--  @RangeBuff เป็นเปอร์เซ็นต์ ไม่ใช่จำนวนสตัด
+--  หลักฐาน: Scout มี @Range 17.5 กับ @RangeBuff 12.5 ตอนมี DJ แทร็ก Purple อยู่ใกล้
+--  และในโมดูลของ DJ เขียนไว้ว่า PurpleTrackBuffs.Range = 12.5
+--  ถ้าเป็นสตัดจริง Scout จะยิงไกล 30 ซึ่งไกลเกินจริงไปมาก
+local function tRange(m)
+    local r = rep(m)
+    if not r then return nil end
+    local base = tonumber(r:GetAttribute("Range"))
+    if not base or base <= 0 then return nil end
+    local buff = tonumber(r:GetAttribute("RangeBuff")) or 0
+    return base * (1 + buff / 100)
+end
+
+--  บอสที่ใกล้ทาวเวอร์ตัวนี้ที่สุด ห่างเท่าไหร่ (คืน nil ถ้าไม่มีบอสหรืออ่านไม่ได้)
+--
+--  วัดแบบราบ ตัดแกน Y ทิ้ง เพราะระยะของทาวเวอร์เป็นวงกลมบนพื้น ไม่ใช่ทรงกลม
+--  บอสตัวสูงหรือตัวที่เดินบนสะพานจะได้ไม่ถูกนับว่าไกลกว่าความจริง
+local function bossDistance(m)
+    local r = rep(m)
+    local tp = r and r:GetAttribute("Position")
+    if typeof(tp) ~= "Vector3" then
+        local ok, pv = pcall(function() return m:GetPivot().Position end)
+        tp = ok and pv or nil
+    end
+    if typeof(tp) ~= "Vector3" then return nil end
+
+    local best
+    for _, bp in ipairs(bossPositions()) do
+        local dx, dz = bp.X - tp.X, bp.Z - tp.Z
+        local d = math.sqrt(dx * dx + dz * dz)
+        if not best or d < best then best = d end
+    end
+    return best
+end
+
+--  บอสเข้าระยะของทาวเวอร์ตัวนี้แล้วหรือยัง
+--  คืน nil = อ่านไม่ได้ (ไม่ใช่ "ยังไม่เข้า") ตัวเรียกจะได้แยกสองกรณีนี้ออกจากกัน
+local function bossInRange(m)
+    local rng = tRange(m)
+    if not rng then return nil end
+    local d = bossDistance(m)
+    if not d then return nil end
+    return d <= rng, d, rng
+end
+
+--  ราคาอัปเกรดขั้นถัดไปของทาวเวอร์ตัวนี้ อ่านสดจากโมดูลเกม
+--
+--  ดีกว่าราคาที่อัดไว้ทุกทาง เพราะราคาที่อัดวัดจากยอดเงินที่เปลี่ยน
+--  ซึ่งเพี้ยนได้ง่ายเวลารัวอัปเกรดหลายครั้งติด (เคยจด 2500 ทั้งที่จ่ายจริง 1300)
+--  ส่วนตัวเลขในโมดูลคือของที่เกมใช้จริง ไม่มีทางเพี้ยน
+--
+--  @GoldenPerks บอกว่าทาวเวอร์ตัวนี้เป็นสกิน Golden หรือเปล่า ซึ่งใช้คนละตารางราคา
+local function upgradeCost(m)
+    local r = rep(m)
+    if not r then return nil end
+    local costs = upgradeCosts(tName(m), r:GetAttribute("GoldenPerks") == true)
+    if not costs then return nil end
+    return costs[tLevel(m) + 1]
+end
+
+--  หน้าสรุปผลตอนจบเกม
+--
+--  ตอนแรกผมเดาว่าเป็น workspace.Triumph ซึ่งผิด — log จริงบอกว่าไม่มีตัวนั้นอยู่เลย
+--  ทั้งตอนเริ่มและตอนจบ ตัวจับจบเกมเดิมจึงไม่เคยทำงาน
+--
+--  ของจริงคือกล่อง gameOver ใน ReactGameNewRewards ซึ่งโผล่ทั้งตอนชนะและแพ้
+--  ป้ายข้างในเขียน "TRIUMPH!" ตอนชนะ จึงใช้แยกผลได้ด้วย
+--  คืน nil = ยังไม่จบ, คืนข้อความ = จบแล้ว
+local function endBanner()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local rw  = gui and gui:FindFirstChild("ReactGameNewRewards")
+    local fr  = rw and rw:FindFirstChild("Frame")
+    local go  = fr and fr:FindFirstChild("gameOver")
+    if not go then return nil end
+    if go:IsA("GuiObject") and not go.Visible then return nil end
+
+    for _, d in ipairs(go:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text ~= "" then return d.Text end
+    end
+    return ""      -- กล่องโผล่แล้วแต่ยังไม่มีข้อความ ถือว่าจบแล้วเหมือนกัน
+end
+
+--  นับแยกตามชนิด เช่น "Scout=6 Farm=8"
+--  ถ้าการปฏิเสธมาจากลิมิตของทาวเวอร์ชนิดใดชนิดหนึ่ง ตัวเลขนี้จะฟ้องทันที
+local function towerBreakdown()
+    local f = towersFolder()
+    if not f then return "-" end
+
+    local by, total = {}, 0
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) then
+            total = total + 1
+            local n = tName(m) or "?"
+            by[n] = (by[n] or 0) + 1
+        end
+    end
+
+    local parts = {}
+    for n, c in pairs(by) do table.insert(parts, ("%s=%d"):format(n, c)) end
+    table.sort(parts)
+    return ("%d ตัว (%s)"):format(total, table.concat(parts, " "))
+end
+
+local function countOfType(name)
+    local f = towersFolder()
+    if not (f and name) then return 0 end
+    local n = 0
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) and tName(m) == name then n = n + 1 end
+    end
+    return n
+end
+
+local function myTowerCount()
+    local f = towersFolder()
+    if not f then return 0 end
+    local n = 0
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) then n = n + 1 end
+    end
+    return n
+end
+
+--  หาทาวเวอร์ที่เพิ่งโผล่จากคำสั่งวางของเรา
+--
+--  exclude คือรายชื่อทาวเวอร์ที่มีอยู่ "ก่อน" ส่งคำสั่ง — จำเป็นมาก
+--  ถ้าไม่กันไว้ แล้วผู้ใช้กดเล่นมาโครตอนที่ในสนามมีทาวเวอร์อยู่แล้ว
+--  ตัวเก่าที่ยืนอยู่จุดเดียวกันจะถูกนับว่า "วางสำเร็จ" ทันที
+--  ทั้งที่คำสั่งจริงถูกปฏิเสธ แล้วคำสั่งอัปเกรดที่ตามมาจะไปลงผิดตัว
+--
+--  เดิมบังคับให้ตำแหน่งตรงกันในรัศมี 1 สตัด ซึ่งเข้มเกินไปและเป็นบั๊ก:
+--  ถ้าเซิร์ฟเวอร์วางให้จริงแต่ขยับตำแหน่งเล็กน้อย หรือ attribute มาช้ากว่าที่รอ
+--  เราจะสรุปว่าพลาดแล้วยิงซ้ำ คราวนี้จุดนั้นมีของอยู่แล้วจึงถูกปฏิเสธจริง
+--  สุดท้ายมาโครมองว่าวางไม่ขึ้น แล้วข้ามการอัปเกรดของทาวเวอร์ตัวนั้นทั้งหมด
+--
+--  คำสั่งวางหนึ่งครั้งสร้างทาวเวอร์ได้ตัวเดียว ดังนั้นทาวเวอร์ "ใหม่" ที่เป็น
+--  ของเราและชนิดตรงกัน ย่อมเป็นผลจากคำสั่งนี้แน่นอน ไม่ต้องยึดตำแหน่งเป็นเงื่อนไข
+--  ใช้ระยะเป็นแค่ตัวตัดสินเวลามีหลายตัวเข้าข่าย
+local function findNewTower(before, pos, wantName)
+    local f = towersFolder()
+    if not f then return nil end
+
+    local best, bestDist
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) and not modelRef[m] and not (before and before[m]) then
+            if (not wantName) or tName(m) == wantName then
+                local p = tPos(m)
+                local d = (p and pos) and (p - pos).Magnitude or math.huge
+
+                --  กันตัวที่อยู่คนละมุมแมพ เผื่อมีทาวเวอร์โผล่จากทางอื่น
+                if d < 12 and (not bestDist or d < bestDist) then
+                    best, bestDist = m, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+--  ตามหาทาวเวอร์ของ ref ที่ยังจับคู่ไม่ได้ โดยดูจากตำแหน่งที่อัดไว้
+--
+--  จำเป็นเพราะบางครั้งเซิร์ฟเวอร์วางให้จริงแต่เราสรุปว่าพลาด (เช่นตอบกลับแปลกๆ
+--  หรือจังหวะไม่ลงตัว) ถ้าตัดการอัปเกรดทิ้งไปเลย ทาวเวอร์ตัวนั้นจะอยู่ระดับ 0
+--  ทั้งเกม ซึ่งกระทบแรงกว่าการวางพลาดเองเสียอีก
+--
+--  รัศมี 3 สตัดและต้องเป็นทาวเวอร์ชนิดเดียวกัน — ตำแหน่งที่ส่งกับที่เซิร์ฟเวอร์
+--  บันทึกต่างกันแค่ระดับทศนิยม ถ้ากว้างกว่านี้เสี่ยงไปคว้าทาวเวอร์ตัวข้างๆ
+--  แล้วอัปเกรดผิดตัว ซึ่งแย่กว่าไม่อัปเกรดเลย
+local function recoverRef(ref)
+    local want = refPos[ref]
+    if not want then return nil end
+
+    local f = towersFolder()
+    if not f then return nil end
+
+    local best, bestDist
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) and not modelRef[m]
+            and ((not want.name) or tName(m) == want.name) then
+            local p = tPos(m)
+            local d = p and (p - want.pos).Magnitude or math.huge
+            if d <= 3 and (not bestDist or d < bestDist) then
+                best, bestDist = m, d
+            end
+        end
+    end
+
+    if best then
+        refModel[ref]  = best
+        modelRef[best] = ref
+        deadRef[ref]   = nil
+    end
+    return best
+end
+
+--  Data ของสกิลบางตัวไม่ว่าง — สกิลที่ต้องเล็งเป้า (มี AbilityIndicator)
+--  จะแนบตำแหน่งหรือค่าอื่นมาด้วย เดิมตอนเล่นผมส่ง Data = {} ตายตัว
+--  สกิลพวกนั้นจึงส่งไปแล้วเซิร์ฟเวอร์ไม่รู้จะทำอะไร กลายเป็นไม่ทำงาน
+--
+--  JSON เก็บ Vector3/CFrame ตรงๆ ไม่ได้ ต้องแปลงเป็นตารางแล้วแปลงกลับ
+local function packValue(v, depth)
+    depth = depth or 0
+    if depth > 5 then return nil end
+
+    local ty = typeof(v)
+    if ty == "number" or ty == "string" or ty == "boolean" then
+        return v
+    elseif ty == "Vector3" then
+        return { __t = "v3", v = { v.X, v.Y, v.Z } }
+    elseif ty == "Vector2" then
+        return { __t = "v2", v = { v.X, v.Y } }
+    elseif ty == "CFrame" then
+        return { __t = "cf", v = { v:GetComponents() } }
+    elseif ty == "Color3" then
+        return { __t = "c3", v = { v.R, v.G, v.B } }
+    elseif ty == "table" then
+        local out = {}
+        for k, val in pairs(v) do
+            if type(k) == "string" or type(k) == "number" then
+                local packed = packValue(val, depth + 1)
+                if packed ~= nil then out[tostring(k)] = packed end
+            end
+        end
+        return out
+    end
+
+    --  Instance ชี้ไปที่ของในเกมรอบนั้น รอบใหม่ไม่มีทางหาตัวเดิมเจอ เก็บไม่ได้
+    return nil
+end
+
+local function unpackValue(v)
+    if type(v) ~= "table" then return v end
+
+    local t = v.__t
+    if t == "v3" then return Vector3.new(v.v[1], v.v[2], v.v[3])
+    elseif t == "v2" then return Vector2.new(v.v[1], v.v[2])
+    elseif t == "c3" then return Color3.new(v.v[1], v.v[2], v.v[3])
+    elseif t == "cf" then return CFrame.new(table.unpack(v.v))
+    end
+
+    local out = {}
+    for k, val in pairs(v) do
+        --  JSON เปลี่ยนคีย์ตัวเลขเป็นข้อความ ต้องแปลงกลับ ไม่งั้นตารางลำดับจะเสีย
+        out[tonumber(k) or k] = unpackValue(val)
+    end
+    return out
+end
+
+-- ═══════════════════════════════════════════════════
+--  คำสั่งที่ส่งเข้าเกม
+-- ═══════════════════════════════════════════════════
+local function cmdSelectSlot(slot) RE:FireServer("Hotbar", "Click", slot) end
+
+local function cmdStream(name, skin)
+    RE:FireServer("Streaming", "SelectTower", name, skin or "Default")
+end
+
+local function cmdPlace(rotCF, pos, name)
+    return RF:InvokeServer("Troops", "Place", { Rotation = rotCF, Position = pos }, name)
+end
+
+local function cmdUpgrade(m) return RF:InvokeServer("Troops", "Upgrade", "Set", { Troop = m }) end
+local function cmdSell(m)    return RF:InvokeServer("Troops", "Sell", { Troop = m }) end
+
+local function cmdTarget(m, mode)
+    return RF:InvokeServer("Troops", "Target", "Set", { Troop = m, Target = mode })
+end
+
+--  ตัวเลือกของทาวเวอร์ เช่นแผ่นเสียงของ DJ Booth
+--  เป็นคนละคำสั่งกับสกิล ผลไปโผล่ที่ @Options เป็นข้อความ JSON
+local function cmdOption(m, name, value)
+    return RF:InvokeServer("Troops", "Option", "Set",
+        { Troop = m, Name = name, Value = value })
+end
+
+local function cmdAbility(m, name, data)
+    return RF:InvokeServer("Troops", "Abilities", "Activate",
+        { Troop = m, Name = name, Data = data or {} })
+end
+
+local function cmdSkip(a)
+    local n = a and a.extraN or 0
+    if n <= 0 then
+        return RF:InvokeServer("Voting", "Skip")
+    end
+
+    local args = table.create(n)
+    for i = 1, n do
+        args[i] = unpackValue(a.extra and a.extra[tostring(i)])
+    end
+    return RF:InvokeServer("Voting", "Skip", table.unpack(args, 1, n))
+end
+
+-- ═══════════════════════════════════════════════════
+--  บันทึก / โหลดไฟล์
+-- ═══════════════════════════════════════════════════
+local function ensureFolder()
+    pcall(function()
+        if not isfolder("ShadowXHub") then makefolder("ShadowXHub") end
+        if not isfolder(MACRO_DIR)    then makefolder(MACRO_DIR)    end
+    end)
+end
+
+local function saveLog()
+    if #logLines == 0 then return false end
+    ensureFolder()
+    return (pcall(function()
+        writefile(MACRO_DIR .. "/playlog.txt", table.concat(logLines, "\n"))
+    end))
+end
+
+--  ชื่อไฟล์ต้องไม่มีอักขระที่ระบบไฟล์ไม่รับ ไม่งั้น writefile จะเงียบๆ ไม่เขียน
+local function safeName(n)
+    n = tostring(n or ""):gsub('[<>:"/\\|%?%*]', "")
+    n = n:gsub("^%s+", ""):gsub("%s+$", "")
+    return n ~= "" and n or "Macro"
+end
+
+local function macroPath(n) return MACRO_DIR .. "/" .. safeName(n) .. ".json" end
+
+local EMPTY_LIST = T("EMPTY_LIST")
+
+local function listMacros()
+    ensureFolder()
+    local out = {}
+    pcall(function()
+        for _, f in ipairs(listfiles(MACRO_DIR)) do
+            local n = tostring(f):match("([^/\\]+)%.json$")
+            if n then table.insert(out, n) end
+        end
+    end)
+    table.sort(out)
+    if #out == 0 then out = { EMPTY_LIST } end
+    return out
+end
+
+local function writeMacro(m)
+    ensureFolder()
+    local ok, err = pcall(function()
+        writefile(macroPath(m.name), HttpService:JSONEncode({
+            version   = 1,
+            name      = m.name,
+            map       = m.map,
+            mode      = m.mode,
+            startWave = m.startWave,
+            towers    = m.towers,
+            slots     = m.slots,
+            autoBuff  = m.autoBuff,
+            loadout   = m.loadout,
+            actions   = m.actions,
+        }))
+    end)
+    if not ok then lastError = tostring(err) end
+    return ok
+end
+
+local function newMacro(name)
+    local m = {
+        name      = safeName(name),
+        map       = getMapName(),
+        mode      = getDifficulty(),
+        startWave = getWave(),
+        towers    = {},
+        slots     = {},
+        loadout   = nil,
+        actions   = {},
+        t0        = os.clock(),
+    }
+    return m
+end
+
+local function loadMacro(n)
+    local path = macroPath(n)
+    if not isfile(path) then
+        status = T("NO_FILE")
+        return false
+    end
+
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+    if not ok or type(data) ~= "table" or type(data.actions) ~= "table" then
+        status = T("BAD_FILE")
+        return false
+    end
+
+    data.t0     = os.clock()
+    data.towers = data.towers or {}
+    data.slots  = data.slots or {}
+    macro       = data
+    currentName = safeName(n)
+
+    --  เด้งช่องเลือกด่านให้ตรงกับด่านของมาโครนี้
+    --
+    --  ถ้าปล่อยให้ตั้งสองที่เอง พลาดง่ายมากและอาการที่ได้คือค้างตลอดกาล:
+    --  โหวตไปด่านหนึ่ง แล้วมาโครนั่งรออีกด่านหนึ่งที่ไม่มีวันมาถึง
+    --  มาโครรู้ด่านของตัวเองอยู่แล้ว ให้มันตั้งให้เลยดีกว่าให้คนจำ
+    if type(data.map) == "string" and data.map ~= "" and data.map ~= "?" then
+        wantMap = data.map
+        pcall(function()
+            if MapDropdown.Select then MapDropdown:Select(data.map)
+            else MapDropdown:Set(data.map) end
+        end)
+    end
+
+    local towers = table.concat(data.towers, ", ")
+    status = T("SELECTED", currentName, #data.actions, data.map or "?",
+        towers ~= "" and T("USES", towers) or "")
+    return true
+end
+
+local function deleteMacro(n)
+    local path = macroPath(n)
+    if not isfile(path) then
+        status = T("NO_FILE")
+        return false
+    end
+    local ok = pcall(function() delfile(path) end)
+    if ok then
+        if currentName == safeName(n) then
+            macro, currentName = nil, ""
+        end
+        status = T("DELETED", safeName(n))
+    else
+        status = T("DEL_FAIL")
+    end
+    return ok
+end
+
+-- ═══════════════════════════════════════════════════
+--  ตรวจโหลดเอาต์
+--
+--  เทียบราคาของแต่ละช่อง hotbar กับตอนที่อัด ราคาต่างกัน = คนละทาวเวอร์
+--  ถ้าไม่ตรงแล้วปล่อยให้เล่นไป มาโครจะวางผิดตัวทั้งชุดตั้งแต่คำสั่งแรก
+-- ═══════════════════════════════════════════════════
+local function checkLoadout()
+    if not macro then return true, T("NO_MACRO") end
+    if not macro.loadout then
+        return true, T("NO_LOADOUT")
+    end
+
+    local now = hotbarCosts()
+    if not now then return true, T("CANT_READ_LO") end
+
+    local bad = {}
+    for slot, cost in pairs(macro.loadout) do
+        local cur = now[slot]
+        if cur ~= cost then
+            local who = macro.slots and macro.slots[slot]
+            table.insert(bad, T("SLOT_DIFF", slot, tostring(cost),
+                who and (" (" .. who .. ")") or "",
+                cur and ("$" .. cur) or T("EMPTY_SLOT")))
+        end
+    end
+
+    table.sort(bad)
+    if #bad == 0 then return true, T("LO_OK") end
+    return false, T("LO_BAD") .. "\n" .. table.concat(bad, "\n")
+end
+
+-- ═══════════════════════════════════════════════════
+--  ตัวอัด
+--
+--  ดัก __namecall แบบเบาที่สุด — ในตัว hook แค่โยนของใส่คิวแล้วปล่อยผ่าน
+--  งานหนักไปทำในลูปแยก ถ้าทำงานหนักในนี้ InvokeServer จะรอคำตอบ
+--  เซิร์ฟเวอร์ไม่ทัน แล้วปุ่มในเกมจะพัง (เจอมาแล้วตอนเขียน debug)
+--
+--  คำสั่งที่สคริปต์นี้ส่งเองจะไม่ถูกอัดซ้ำ เพราะ checkcaller() เป็น true
+-- ═══════════════════════════════════════════════════
+local queue, qHead, qTail = {}, 1, 0
+
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    if recording and (self == RE or self == RF) then
+        local method = getnamecallmethod()
+        if (method == "FireServer" or method == "InvokeServer") and not checkcaller() then
+            qTail = qTail + 1
+            queue[qTail] = table.pack(...)
+        end
+    end
+    return oldNamecall(self, ...)
+end)
+
+--  คิววัดราคาอัปเกรด แยกตามทาวเวอร์
+--
+--  เดิมใช้ task.delay(1.2) แล้วค่อยอ่าน @TotalSpent ซึ่งพังทันทีถ้าผู้เล่นรัว
+--  อัปเกรดตัวเดียวกันหลายครั้งรวด เพราะทุกครั้งจะไปอ่านตอนที่อัปครบหมดแล้ว
+--  ครั้งแรกจึงได้ราคาเท่ากับยอดรวมของทั้งชุด สูงเกินจริงหลายเท่า
+--  แล้วตอนเล่นมาโครก็จะนั่งรอเงินที่ไม่เคยต้องใช้จนหมดเวลาแล้วข้ามคำสั่งนั้นทิ้ง
+--
+--  คราวนี้ผูกกับสัญญาณ @TotalSpent เปลี่ยนแทน ทุกครั้งที่ยอดขยับ
+--  จะจับคู่ส่วนต่างเข้ากับคำสั่งที่รออยู่ตัวแรกสุด เรียงตามลำดับที่กดจริง
+local upgradeQueue = {}
+local upgradeConns = {}
+
+local function trackUpgradeCost(m, action)
+    local q = upgradeQueue[m]
+
+    if not q then
+        q = { spent = tSpent(m), waiting = {} }
+        upgradeQueue[m] = q
+
+        local r = rep(m)
+        if r then
+            local conn = r:GetAttributeChangedSignal("TotalSpent"):Connect(function()
+                local now  = tSpent(m)
+                local diff = now - q.spent
+                q.spent = now
+                local a = table.remove(q.waiting, 1)
+                if a and diff > 0 then a.cost = diff end
+            end)
+            table.insert(upgradeConns, conn)
+        end
+    end
+
+    table.insert(q.waiting, action)
+end
+
+local function clearUpgradeTracking()
+    for _, c in ipairs(upgradeConns) do pcall(function() c:Disconnect() end) end
+    upgradeConns = {}
+    upgradeQueue = {}
+end
+
+local dropped = 0      -- คำสั่งที่อัดไว้แล้วถูกถอดออกเพราะเกมไม่รับ
+
+--  เวลาที่แต่ละเวฟเริ่ม (วินาทีนับจากเริ่มอัด)
+--
+--  จำเป็นเพราะ "กดสกิลตอนบอสออก" ไม่ได้ผูกกับเวลาตั้งแต่เริ่มเกม
+--  แต่ผูกกับ "วินาทีที่เท่าไหร่ของเวฟนั้น" ตอนเล่นซ้ำเวลารวมจะเลื่อนเสมอ
+--  (รอเงิน รอโหวต ฯลฯ) ถ้ายึดเวลารวมก็จะกดผิดจังหวะไปทั้งชุด
+local waveAt = {}
+
+local function addAction(a)
+    local now = os.clock() - macro.t0
+    a.t    = now
+    a.wave = getWave()
+    a.tw   = now - (waveAt[a.wave] or 0)      -- วินาทีที่เท่าไหร่ของเวฟนั้น
+    table.insert(macro.actions, a)
+    return a
+end
+
+--  เฝ้าว่าเวฟเปลี่ยนตอนไหน ระหว่างอัดเท่านั้น
+local function watchWavesWhileRecording()
+    task.spawn(function()
+        local last = getWave()
+        waveAt[last] = os.clock() - macro.t0
+        while recording do
+            local w = getWave()
+            if w ~= last then
+                last = w
+                waveAt[w] = os.clock() - macro.t0
+            end
+            task.wait(0.2)
+        end
+    end)
+end
+
+--  ตรวจย้อนหลังว่าคำสั่งที่เพิ่งอัดไปนั้นเกมรับจริงไหม ถ้าไม่รับก็ถอดออก
+--
+--  จำเป็นเพราะตัวดักเห็นแค่คำสั่งขาออก ไม่เห็นคำตอบของเซิร์ฟเวอร์
+--  (จะไปดักคำตอบก็ไม่ได้ เพราะการรอผลข้างใน hook เป็นการ yield ข้ามขอบเขต
+--  metamethod ซึ่ง Roblox ไม่ยอม แล้วคำสั่งในเกมจะพังทั้งหมด)
+--
+--  ผู้เล่นกดพลาดเป็นเรื่องปกติ เช่นวางทาวเวอร์เกินลิมิต หรือวางในจุดที่วางไม่ได้
+--  ถ้าปล่อยให้ติดเข้ามาโคร ตอนเล่นซ้ำมันจะไปยิงคำสั่งที่ไม่มีวันสำเร็จ
+--  เสียเวลาลองซ้ำ แล้วไปกินจังหวะของคำสั่งข้างหลังที่มีหน้าต่างเวลาจำกัด
+--
+--  ดูจากผลที่เกิดขึ้นในเกมจริง ไม่ใช่จากคำสั่งที่ส่งไป
+local function verifyLater(owner, action, label, check, wait)
+    task.delay(wait or 2.5, function()
+        --  อัดรอบใหม่ไปแล้ว ของเก่าไม่เกี่ยวกันแล้ว
+        if macro ~= owner then return end
+
+        local ok, effective = pcall(check)
+        if ok and effective then return end
+
+        for i = #owner.actions, 1, -1 do
+            if owner.actions[i] == action then
+                table.remove(owner.actions, i)
+                dropped = dropped + 1
+                dlog("ถอดคำสั่งที่เกมไม่รับออก: %s", label)
+                break
+            end
+        end
+    end)
+end
+
+local function handleCommand(a)
+    if not (recording and macro) then return end
+
+    local ns, act = a[1], a[2]
+
+    --  จำช่องกับสกินที่กดล่าสุด เอาไว้เติมให้คำสั่งวางที่ตามมา
+    if ns == "Hotbar" and act == "Click" then lastSlot = a[3] return end
+    if ns == "Streaming" and act == "SelectTower" then lastSkin = a[4] return end
+
+    if ns == "Voting" and act == "Skip" then
+        --  หนึ่งเวฟโหวตข้ามได้ครั้งเดียว การกดซ้ำคือการยกเลิกโหวตของตัวเอง
+        --  ถ้าอัดไว้ทั้งคู่ ตอนเล่นมาโครจะเปิดแล้วปิดโหวตทันที เกมไม่เริ่มสักที
+        --
+        --  log จริงเจอ skip ที่เวฟ 0 ถึงสามครั้ง ทำให้มาโครค้างอยู่ 130 วินาที
+        --  กว่าครั้งที่สามจะบังเอิญเปิดโหวตกลับ
+        local w = getWave()
+        for _, prev in ipairs(macro.actions) do
+            if prev.type == "skip" and prev.wave == w then return end
+        end
+
+        --  เก็บอาร์กิวเมนต์ที่เหลือด้วย ห้ามทิ้ง
+        --  ซอร์สของ VoteWave มีปุ่ม Yes กับ No ที่เรียก Voted(true) / Voted(false)
+        --  แปลว่าโหวตข้ามเวฟน่าจะแนบค่ามาด้วย ต่างจากปุ่ม Ready ตอนก่อนเริ่มเกม
+        --  ที่ดักได้ว่าไม่มีอาร์กิวเมนต์เลย ถ้าทิ้งไปก็เท่ากับส่งคำสั่งไม่ครบ
+        local extra, n = {}, 0
+        for i = 3, a.n do
+            n = n + 1
+            extra[tostring(n)] = packValue(a[i])
+        end
+        addAction({ type = "skip", extra = extra, extraN = n })
+        return
+    end
+    if ns ~= "Troops" then return end
+
+    if act == "Place" then
+        local d, name = a[3], a[4]
+        if type(d) ~= "table" or not d.Position then return end
+
+        refCount = refCount + 1
+        local action = addAction({
+            type  = "place",
+            ref   = refCount,
+            tower = name,
+            skin  = lastSkin,
+            slot  = lastSlot,
+            pos   = { d.Position.X, d.Position.Y, d.Position.Z },
+            rot   = { (d.Rotation or CFrame.new()):GetComponents() },
+            cost  = 0,
+        })
+
+        if lastSlot and name then macro.slots[tostring(lastSlot)] = name end
+
+        --  ราคาจริงต้องรอทาวเวอร์โผล่ก่อนถึงจะอ่าน @TotalSpent ได้
+        table.insert(pendingPlaces,
+            { action = action, pos = d.Position, at = os.clock() })
+
+        --  ไม่มีทาวเวอร์โผล่ = เกมปฏิเสธ (เช่นวางเกินลิมิต หรือจุดนั้นวางไม่ได้)
+        local ref = action.ref
+        verifyLater(macro, action, ("วาง %s"):format(tostring(name)), function()
+            return refModel[ref] ~= nil
+        end, 3)
+
+    elseif act == "Upgrade" then
+        local m = type(a[4]) == "table" and a[4].Troop
+        local r = m and modelRef[m]
+        if not r then return end    -- ไม่ใช่ทาวเวอร์ที่มาโครนี้วางไว้ ข้าม
+
+        --  ราคาอัปเกรดวัดจาก @TotalSpent ที่เพิ่มขึ้น แม่นกว่าอ่านเงินบนจอ
+        --  เพราะเงินอาจขยับจากรายได้ของ Farm พร้อมกันพอดี
+        local spent0, lv0 = tSpent(m), tLevel(m)
+        local up = addAction({ type = "upgrade", ref = r, cost = 0 })
+        trackUpgradeCost(m, up)
+
+        --  ไม่มีอะไรขยับ = เงินไม่พอ หรืออัปจนสุดทางแล้ว
+        verifyLater(macro, up, "อัปเกรด", function()
+            return tSpent(m) > spent0 or tLevel(m) > lv0
+        end)
+
+    elseif act == "Option" then
+        local d = type(a[4]) == "table" and a[4]
+        local m = d and d.Troop
+        local r = m and modelRef[m]
+        if not r or not d.Name then return end
+
+        local rep0 = rep(m)
+        local before = rep0 and rep0:GetAttribute("Options")
+        local opt = addAction({
+            type  = "option",
+            ref   = r,
+            name  = tostring(d.Name),
+            value = packValue(d.Value),
+        })
+
+        verifyLater(macro, opt, ("ตัวเลือก %s"):format(tostring(d.Name)), function()
+            local r2 = rep(m)
+            return r2 ~= nil and r2:GetAttribute("Options") ~= before
+        end)
+
+    elseif act == "Target" then
+        local d = type(a[4]) == "table" and a[4]
+        local m = d and d.Troop
+        local r = m and modelRef[m]
+        if not r or not d.Target then return end
+
+        local before = tTargetMode(m)
+        local tg = addAction({ type = "target", ref = r, mode = tostring(d.Target) })
+
+        verifyLater(macro, tg, ("โหมดเล็ง %s"):format(tostring(d.Target)), function()
+            return tTargetMode(m) ~= before
+        end)
+
+    elseif act == "Sell" then
+        local m = type(a[3]) == "table" and a[3].Troop
+        local r = m and modelRef[m]
+        if not r then return end
+        local sell = addAction({ type = "sell", ref = r })
+
+        verifyLater(macro, sell, "ขาย", function()
+            return m.Parent == nil
+        end)
+
+    elseif act == "Abilities" then
+        local d = type(a[4]) == "table" and a[4]
+        local m = d and d.Troop
+        local r = m and modelRef[m]
+        if not r or not d.Name then return end
+        --  จดตัวเลือกที่ตั้งไว้ตอนกด
+        --
+        --  สกิลของบางทาวเวอร์ให้ผลต่างกันตามตัวเลือก เช่น Drop The Beat ของ DJ Booth
+        --    Purple  ผลักและชะลอศัตรู
+        --    Green   ได้เงินตามจำนวนทาวเวอร์ในระยะ
+        --    Red     ทำดาเมจและลดเกราะ
+        --  กดถูกจังหวะแต่ Track ผิด = ได้เอฟเฟกต์คนละอย่างกับที่ตั้งใจ
+        local rep0 = rep(m)
+        local opts = rep0 and rep0:GetAttribute("Options")
+        if type(opts) ~= "string" or opts == "" or opts == "[]" then opts = nil end
+
+        --  จดว่าตอนกดมีบอสอยู่ในสนามไหม
+        --  ถ้ามี แปลว่าผู้เล่นตั้งใจกดตอนบอสออก ซึ่งเป็นจังหวะที่แม่นกว่าการนับวินาที
+        --  เพราะรอบหน้าบอสอาจออกช้าหรือเร็วกว่าเดิมตามความเร็วที่เคลียร์เวฟ
+        addAction({
+            type = "ability",
+            ref  = r,
+            name = d.Name,
+            data = packValue(d.Data) or {},
+            boss = bossOnField() or nil,
+            opts = opts,
+        })
+    end
+end
+
+task.spawn(function()
+    while true do
+        while qHead <= qTail do
+            local item = queue[qHead]
+            queue[qHead] = nil
+            qHead = qHead + 1
+            pcall(handleCommand, item)
+        end
+        task.wait(0.1)
+    end
+end)
+
+--  ทาวเวอร์ที่เพิ่งโผล่ = ผลของคำสั่งวางที่เพิ่งส่งไป จับคู่ด้วยตำแหน่ง
+--
+--  การผูก ref ตรงนี้สำคัญกว่าที่เห็น เพราะตัวอัดจะจดคำสั่งอัปเกรด/ขาย/สกิล
+--  เฉพาะทาวเวอร์ที่ผูก ref ไว้ได้เท่านั้น ถ้าผูกไม่ติด คำสั่งพวกนั้นจะถูกทิ้งเงียบๆ
+--  โดยไม่มีอะไรฟ้องเลย — ผู้เล่นจะเห็นแค่ว่า "อัปเกรดตัวแรกๆ ไม่ถูกจด"
+--
+--  ของเดิมรอ 0.4 วินาทีแล้วอ่านตำแหน่งทีเดียว ถ้า @Position ยังมาไม่ถึงก็ปล่อยผ่าน
+--  ซึ่งเกิดบ่อยที่สุดตอนเริ่มเกมที่โหลดหนัก คือช่วงที่วางทาวเวอร์ตัวแรกๆ พอดี
+local function bindNewTower(m)
+    if not recording then return end
+
+    --  รอจนกว่าจะอ่านตำแหน่งได้จริง ไม่ใช่เช็คครั้งเดียวแล้วยอมแพ้
+    local p
+    for _ = 1, 30 do
+        if not recording then return end
+        p = tPos(m)
+        if p then break end
+        task.wait(0.1)
+    end
+    if not p or not isMine(m) then return end
+
+    --  จับคู่กับคำสั่งวางที่ใกล้ที่สุดในคิว
+    local best, bestDist, bestIdx
+    for i = #pendingPlaces, 1, -1 do
+        local pp = pendingPlaces[i]
+        if os.clock() - pp.at > 15 then
+            table.remove(pendingPlaces, i)      -- เก่าเกินไป ทิ้ง
+        else
+            local d = (p - pp.pos).Magnitude
+            if d <= 2 and (not bestDist or d < bestDist) then
+                best, bestDist, bestIdx = pp, d, i
+            end
+        end
+    end
+    if not best then return end
+
+    table.remove(pendingPlaces, bestIdx)
+    refModel[best.action.ref] = m
+    modelRef[m] = best.action.ref
+    best.action.cost = tSpent(m)
+end
+
+local towerConn
+local function watchTowers()
+    if towerConn then towerConn:Disconnect() end
+    local f = towersFolder()
+    if not f then return end
+    towerConn = f.ChildAdded:Connect(function(m)
+        task.spawn(function() pcall(bindNewTower, m) end)
+    end)
+end
+
+watchTowers()
+workspace.ChildAdded:Connect(function(c)
+    if c.Name == "Towers" then task.wait(0.5) watchTowers() end
+end)
+
+-- ═══════════════════════════════════════════════════
+--  เริ่ม / หยุดอัด
+-- ═══════════════════════════════════════════════════
+--  startRecording อยู่เหนือ watchGameOver แต่ต้องเรียกมันได้
+--  ถ้าไม่ประกาศตรงนี้ ชื่อจะกลายเป็นตัวแปร global ที่เป็น nil แล้วพังตอนกดอัด
+local watchGameOver
+
+--  จดลงมาโครว่า "รอบนี้ใช้หมุนบัฟของชนิดไหน"
+--
+--  ต้องเรียกได้จากหลายที่ เพราะจังหวะที่ผู้ใช้เปิดหมุนบัฟไม่แน่นอน
+--  และเกือบทุกครั้งจะเป็น "หลังกดอัดไปแล้ว" ไม่ใช่ก่อน
+--
+--  เหตุผลที่หลีกเลี่ยงไม่ได้: สวิตช์หมุนบัฟหาชนิดจากทาวเวอร์ที่อยู่ในสนามจริง
+--  ตอนกดเริ่มอัด สนามยังว่าง ยังไม่มี Commander สักตัว กดเปิดตอนนั้นจะไม่ผ่าน
+--  ผู้ใช้จึงต้องวาง Commander ก่อนแล้วค่อยเปิด ซึ่งเลยจุดที่โค้ดเดิมจดไว้ไปแล้ว
+--  ผลคือมาโครไม่เคยมี autoBuff ติดไปเลยสักไฟล์ แล้วตอนเล่นก็ไม่มีใครกดบัฟให้
+local function stampAutoBuff()
+    if not (macro and autoBuff) then return end
+    if buffKind == "" then return end
+    macro.autoBuff = { kind = buffKind }
+end
+
+local function startRecording()
+    if playing then status = T("PLAYING_STOP") return false end
+    if not inGame() then status = T("NOT_IN_GAME") return false end
+    if not macro then status = T("PICK_FIRST") return false end
+
+    refModel, modelRef = {}, {}
+    refCount = 0
+    pendingPlaces = {}
+    lastSlot, lastSkin = nil, nil
+    queue, qHead, qTail = {}, 1, 0
+    clearUpgradeTracking()
+
+    --  อัดใหม่ = เขียนทับของเดิมทั้งหมด ไม่ใช่ต่อท้าย
+    macro.actions   = {}
+    macro.towers    = {}
+    macro.slots     = {}
+    macro.map       = getMapName()
+    macro.mode      = getDifficulty()
+    macro.startWave = getWave()
+    macro.t0        = os.clock()
+
+    --  เก็บโหลดเอาต์ไว้ตั้งแต่ตอนนี้ ตอนจบอาจออกจากแมพไปแล้วอ่านไม่ได้
+    macro.loadout = hotbarCosts()
+
+    --  จดไว้ว่าตอนอัดเปิดหมุนบัฟไว้หรือเปล่า
+    --
+    --  การกดของระบบหมุนบัฟเป็นการเรียกจากสคริปต์เอง จึงถูก checkcaller() กรองออก
+    --  ไม่มี action สกิลติดเข้ามาโครเลย ถ้าไม่จดไว้ ตอนเล่นซ้ำจะไม่มีใครกดบัฟให้
+    --  พอจดไว้ ตอนเล่นก็เปิดหมุนบัฟให้เองอัตโนมัติ — และรู้ด้วยว่าไม่ต้องกดซ้ำ
+    --
+    --  ล้างของเก่าก่อน แล้วค่อยจดใหม่ ไม่งั้นค่าจากมาโครที่โหลดไว้จะติดมาด้วย
+    --  ทั้งที่รอบนี้ไม่ได้เปิดหมุนบัฟเลย
+    macro.autoBuff = nil
+    stampAutoBuff()
+
+    dropped = 0
+    waveAt = {}
+    recording = true
+    status = T("RECORDING")
+    watchWavesWhileRecording()
+    watchGameOver()
+    return true
+end
+
+--  ปิดการอัดถูกเรียกได้จากสองทาง — ผู้ใช้กดสวิตช์เอง กับตัวเฝ้าจบเกม
+--  ถ้าปล่อยให้ทำงานซ้อนกัน macro.towers จะมีชื่อซ้ำและไฟล์จะถูกเขียนสองรอบ
+local stopping = false
+
+local function stopRecording(reason)
+    --  ปุ่มยกเลิกใน popup สั่งปิดสวิตช์ ซึ่งไปกระตุ้น callback นี้ทั้งที่ยังไม่เคยอัด
+    --  ถ้าไม่กันไว้ มันจะเขียนไฟล์ทับและขึ้นข้อความว่า "อัดเสร็จแล้ว" ทั้งที่ไม่ได้ทำอะไร
+    if stopping or not recording then return end
+    stopping = true
+    recording = false
+
+    task.wait(0.4)      -- ปล่อยให้คิวที่ค้างอยู่ประมวลผลจบก่อน
+    task.wait(1.0)      -- และให้สัญญาณราคาอัปเกรดตัวสุดท้ายมาถึง
+    clearUpgradeTracking()
+
+    if not macro then stopping = false return end
+
+    macro.towers = {}
+    local seen = {}
+    for _, a in ipairs(macro.actions) do
+        if a.type == "place" and a.tower and not seen[a.tower] then
+            seen[a.tower] = true
+            table.insert(macro.towers, a.tower)
+        end
+    end
+
+    --  ถ้าหยุดตอนออกจากแมพไปแล้ว hotbar จะอ่านไม่ได้
+    --  ค่าที่เก็บไว้ตั้งแต่ตอนเริ่มอัดจึงต้องไม่ถูกทับด้วย nil
+    local lo = hotbarCosts()
+    if lo then macro.loadout = lo end
+
+    --  จดหมุนบัฟอีกรอบก่อนบันทึก เผื่อเปิดกลางทางแล้วยังไม่ได้จด
+    --  เก็บซ้ำหลายจุดดีกว่าพลาดจุดเดียวแล้วมาโครใช้ไม่ได้ทั้งไฟล์
+    stampAutoBuff()
+
+    local saved = writeMacro(macro)
+    if not saved then
+        status = T("REC_NOSAVE")
+    elseif reason then
+        status = T(reason, #macro.actions)
+    else
+        status = T("REC_DONE", #macro.actions, macro.name)
+             .. (dropped > 0 and T("REC_DROPPED", dropped) or "")
+    end
+
+    stopping = false
+end
+
+--  เฝ้าว่าเกมจบหรือยัง แล้วปิดการอัดให้เอง
+--
+--  ถ้าไม่ปิด คำสั่งที่ยิงหลังจบเกม (กด Rematch, กลับ lobby, กดใน UI สรุปผล)
+--  จะถูกอัดติดเข้าไปด้วย แล้วตอนเล่นซ้ำมาโครจะไปกดของพวกนั้นกลางเกม
+--
+--  สัญญาณที่ใช้ เรียงตามความมั่นใจ
+--    หน้าสรุปผล — ReactGameNewRewards.Frame.gameOver โผล่ (ยืนยันจาก log จริง)
+--    ออกจากแมพ  — State หรือ workspace.Towers หายไป
+--    เลือดหมด    — State.Health.Current ถึง 0 (สำรอง เผื่อหน้าสรุปยังไม่ทันขึ้น)
+function watchGameOver()
+    task.spawn(function()
+        --  ตอนเพิ่งเข้าแมพ ค่าเลือดอาจยังอ่านได้ 0 อยู่ชั่วครู่
+        --  ต้องเห็นเลือดเกิน 0 สักครั้งก่อน ถึงจะเชื่อว่า 0 แปลว่าแพ้จริง
+        local sawHealth = false
+
+        while recording do
+            local hp = getHealth()
+            if hp > 0 then sawHealth = true end
+
+            local banner = endBanner()
+            local reason
+            if banner then
+                reason = banner:upper():find("TRIUMPH") and "AUTO_WON" or "AUTO_LOST"
+            elseif not inGame() then
+                reason = "AUTO_LEFT"
+            elseif sawHealth and hp <= 0 then
+                reason = "AUTO_LOST"
+            end
+
+            if reason then
+                --  ปิดสวิตช์บน UI ด้วย ไม่งั้นผู้ใช้เห็นว่ายังอัดอยู่
+                --  เรียก stopRecording ตรงๆ ไม่พึ่งว่า :Set จะยิง callback ให้
+                task.spawn(function()
+                    stopRecording(reason)
+                    --  รอให้บันทึกเสร็จก่อนค่อยแจ้ง จะได้บอกจำนวนคำสั่งที่ถูกต้อง
+                    pcall(function()
+                        WindUI:Notify({
+                            Title    = T("AUTO_TITLE"),
+                            Content  = status,
+                            Duration = 8,
+                            Icon     = "circle-check",
+                        })
+                    end)
+                end)
+                pcall(function() RecordToggle:Set(false) end)
+                break
+            end
+
+            task.wait(0.5)
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════════════
+--  ตัวเล่น
+-- ═══════════════════════════════════════════════════
+local function waitUntil(fn, timeout)
+    local t = os.clock()
+    while os.clock() - t < timeout do
+        if fn() then return true end
+        task.wait(0.1)
+    end
+    return false
+end
+
+--  ราคาจริงที่เพิ่งจ่ายไป แยกเก็บนอกตัว action
+--
+--  ไม่เขียนลงในตัว action ตรงๆ เพราะ action ถูกแปลงเป็น JSON ตอนบันทึก
+--  ฟิลด์ชั่วคราวจะติดไปในไฟล์มาโครด้วย แล้วไฟล์จะโตขึ้นเรื่อยๆ ด้วยขยะ
+local paidOf   = {}      -- action → เงินที่จ่ายจริงครั้งล่าสุด
+local costFixed = 0      -- แก้ราคาไปกี่รายการในรอบนี้ (ใช้ตัดสินใจว่าจะบันทึกทับไหม)
+
+--  จำไว้ว่าหยุดกลางคันที่คำสั่งไหน เอาไว้เล่นต่อ
+--
+--  ปิดสวิตช์แล้วเปิดใหม่ระหว่างเกม ของเดิมจะเริ่มนับหนึ่งใหม่หมด
+--  แล้วมันจะไล่วางทาวเวอร์ที่วางไปแล้วซ้ำทั้งชุด ซึ่งไม่มีทางสำเร็จสักตัว
+--  (ชนลิมิต / จุดนั้นมีของอยู่แล้ว) เสียเวลาไปหลายนาทีกว่าจะไล่ถึงจุดเดิม
+--
+--  ต้องเช็คให้ครบว่าเป็น "เกมเดิม" จริง ไม่งั้นเล่นต่อกลางทางของเกมใหม่จะพังหนักกว่า
+local resume = nil   -- { name, index, count, map, wave }
+
+--  ส่งหนึ่งครั้งแล้วยืนยันว่าเกิดผลจริง
+--  การยืนยันสำคัญกว่าการเดาราคา — ถึงคำนวณเงินพลาด ก็ยังรู้ว่าสำเร็จหรือไม่
+local function tryOnce(a, before, attempt)
+    --  ครั้งแรกให้เวลายืนยันเต็มที่ เผื่อเซิร์ฟเวอร์ตอบช้า
+    --  ครั้งหลังสั้นลง เพราะถ้าเซิร์ฟเวอร์รับคำสั่งจริง ผลจะมาภายในเสี้ยววินาที
+    --  การรอ 3.5 วินาทีทุกครั้งที่พลาดคือการเสียเวลาเปล่าล้วนๆ
+    local confirmWait = (attempt or 1) <= 1 and 3.5 or 1.2
+
+    if a.type == "place" then
+        local pos = Vector3.new(a.pos[1], a.pos[2], a.pos[3])
+        local rot = CFrame.new(table.unpack(a.rot))
+
+        --  Walk Around — เดินไปยืนตรงจุดที่วาง
+        --
+        --  ⚠ ห้ามรอให้เดินถึงเด็ดขาด ต้องแยกไปวิ่งคนละสาย
+        --  มาโครต้องทำงานด้วยความเร็วเดิมทุกประการ การเดินเป็นแค่ภาพประกอบ
+        --  ถ้ารอเดินก่อนวาง ทุกคำสั่งจะช้าลงหลายวินาที แล้วรอที่คำนวณเรื่องเงินไว้จะเพี้ยนหมด
+        --
+        --  เดินเฉพาะตอนเปลี่ยนชนิดทาวเวอร์ วางชนิดเดิมซ้ำก็ยืนอยู่ที่เดิม
+        --  เพราะทาวเวอร์ชนิดเดียวกันมักวางเป็นกลุ่มใกล้ๆ กัน เดินทุกใบก็แค่ขยับไปมา
+        if walkAround and a.tower and a.tower ~= lastWalkTower then
+            lastWalkTower = a.tower
+            task.spawn(function() pcall(walkTo, pos, 15) end)
+        end
+
+        if a.slot  then pcall(cmdSelectSlot, a.slot) end
+        if a.tower then pcall(cmdStream, a.tower, a.skin) end
+
+        --  ซอร์สของเกม (NewPlacementController บรรทัด 574) เรียก
+        --    Troops:InvokeServer("Place", {Position=..., Rotation=...}, Name)
+        --  แล้วบรรทัดถัดมาเช็ค u44:IsA("Model")
+        --  แปลว่า remote คืน "โมเดลทาวเวอร์ที่เพิ่งวาง" กลับมาให้เลย
+        --
+        --  ใช้ค่านี้ยืนยันตรงๆ แม่นกว่าการไปไล่หาในโฟลเดอร์แล้วเดาว่าตัวไหนของเรา
+        --  ไม่มีปัญหาจับคู่ผิดตัว ไม่ต้องรอ attribute มาช้า และรู้ผลทันทีไม่ต้องหน่วง
+        local sent, result = pcall(cmdPlace, rot, pos, a.tower)
+
+        --  จดสิ่งที่เซิร์ฟเวอร์ตอบกลับมา นี่คือข้อมูลที่บอกได้ตรงที่สุดว่าทำไมวางไม่ขึ้น
+        --
+        --  ไม่ต้องมีสคริปต์ debug แยกไปดัก __namecall เพื่ออ่านค่านี้
+        --  (ซึ่งทำแล้วพังด้วย เพราะการรอคำตอบข้างใน hook เป็นการ yield
+        --  ข้ามขอบเขต metamethod ที่ Roblox ไม่ยอม แล้วคำสั่งวางจะใช้ไม่ได้เลย)
+        --  มาโครเรียกเองอยู่แล้ว ได้ค่ามาตรงๆ ไม่ต้องแตะของเกม
+        local desc
+        if not sent then
+            desc = "เรียกไม่สำเร็จ: " .. tostring(result)
+        elseif result == nil then
+            desc = "nil (ไม่คืนค่า)"
+        elseif typeof(result) == "Instance" then
+            desc = ("<%s %q>"):format(result.ClassName, result.Name)
+        elseif type(result) == "table" then
+            local parts = {}
+            for k, v in pairs(result) do
+                table.insert(parts, ("%s=%s"):format(tostring(k), tostring(v)))
+                if #parts > 8 then break end
+            end
+            desc = "{ " .. table.concat(parts, ", ") .. " }"
+        else
+            desc = ("%s %s"):format(typeof(result), tostring(result))
+        end
+
+        lastReply = desc
+        dlog("      วาง: เซิร์ฟเวอร์ตอบ %s", desc)
+
+        --  เซิร์ฟเวอร์บอกลิมิตมาเอง จำไว้แล้วครั้งหน้าไม่ต้องยิงให้เสียเวลา
+        if type(result) == "string" then
+            local n, who = result:match("only place%s+(%d+)%s+(.-)%(s%)")
+            if n and who then
+                towerLimit[who] = tonumber(n)
+                dlog("      จำลิมิตไว้: %s วางได้สูงสุด %s ตัว", who, n)
+            end
+        end
+
+        if sent and typeof(result) == "Instance" and result:IsA("Model") then
+            refModel[a.ref]  = result
+            modelRef[result] = a.ref
+            return true
+        end
+
+        --  ได้ค่ากลับมาแต่ไม่ใช่โมเดล = เซิร์ฟเวอร์ปฏิเสธชัดเจน
+        --  คืนธง "ปฏิเสธแน่นอน" ไปด้วย เพื่อให้เลิกยิงซ้ำเร็วขึ้น
+        --  การยิงคำสั่งที่ถูกปฏิเสธซ้ำๆ รัวๆ ไม่ได้ประโยชน์และดูผิดปกติด้วย
+        --  เซิร์ฟเวอร์บอกลิมิตมา = คำสั่งนี้ไม่มีวันสำเร็จในมาโครนี้
+        --  ทำเครื่องหมายไว้ให้ตัดออกตอนจบรอบ จะได้ไม่ต้องมาลองใหม่ทุกครั้งที่เล่น
+        if type(result) == "string" and result:find("only place") then
+            a.impossible = true
+        end
+
+        --  "You need $118 more to place!" คือเรื่องเงินไม่พอ ไม่ใช่การปฏิเสธถาวร
+        --
+        --  เดิมนับรวมกับการปฏิเสธทุกแบบ พอโดนสองครั้งติดก็เลิกลองทั้งที่แค่รอเงินอีกนิดเดียว
+        --  แล้วคำสั่งที่อ้างถึงทาวเวอร์ตัวนั้นก็พังตามกันเป็นแถบ
+        --  (log จริง: วาง Scout พลาดสองครั้งเพราะเงินขาด 118 แล้วอัปเกรดตัวถัดไปไม่มีทาวเวอร์ให้ทำ)
+        if type(result) == "string" and result:find("You need") then
+            return false
+        end
+
+        if sent and result ~= nil then return false, true end
+
+        --  คืน nil มา อาจเป็นเวอร์ชันที่ไม่ส่งโมเดลกลับ ใช้ทางเดิมเป็นตัวสำรอง
+        local got
+        if waitUntil(function()
+            got = findNewTower(before, pos, a.tower)
+            return got ~= nil
+        end, confirmWait) then
+            refModel[a.ref] = got
+            modelRef[got]   = a.ref
+            return true
+        end
+        return false
+
+    elseif a.type == "upgrade" then
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then return false end
+        --  ดูทั้งยอดเงินที่จ่ายและระดับ — ทาวเวอร์บางตัวอัปฟรีจากบัฟส่วนลด
+        --  ถ้าดูแค่ TotalSpent จะเข้าใจผิดว่าอัปไม่ขึ้นแล้ววนซ้ำจนหมดเวลา
+        local spent0, lv0 = tSpent(m), tLevel(m)
+        pcall(cmdUpgrade, m)
+        local ok = waitUntil(function()
+            return tSpent(m) > spent0 or tLevel(m) > lv0
+        end, 2.5)
+
+        --  วัดราคาจริงจาก @TotalSpent ของทาวเวอร์ตัวนั้นเอง
+        --
+        --  นี่คือตัวเลขจากเซิร์ฟเวอร์ ไม่ใช่การอ่านยอดเงินจากป้าย UI
+        --  ยอดเงินบนป้ายมาช้ากว่าความจริงหลายเฟรม และเปลี่ยนตลอดจากรายได้ฟาร์ม
+        --  ลบกันแล้วจึงได้เลขมั่วเสมอ ส่วน @TotalSpent ขยับเฉพาะตอนเราจ่ายจริง
+        --
+        --  ต้องรอต่ออีกนิดเพราะเงื่อนไขข้างบนผ่านได้ด้วย @Upgrade อย่างเดียว
+        --  ซึ่งบางทีมาถึงก่อน @TotalSpent เสี้ยววินาที ถ้าอ่านทันทีจะได้ 0
+        if ok then
+            waitUntil(function() return tSpent(m) > spent0 end, 1.5)
+            local paid = tSpent(m) - spent0
+            if paid > 0 then paidOf[a] = paid end
+        end
+        return ok
+
+    elseif a.type == "option" then
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then return false end
+
+        local want = unpackValue(a.value)
+        pcall(cmdOption, m, a.name, want)
+
+        --  @Options เป็นข้อความ JSON เช่น {"Track":"Green"}
+        --  เทียบแบบถอดรหัสก่อน ถ้าถอดไม่ได้ค่อยเทียบเป็นข้อความตรงๆ
+        return waitUntil(function()
+            local rep0 = rep(m)
+            local raw  = rep0 and rep0:GetAttribute("Options")
+            if type(raw) ~= "string" then return false end
+
+            local ok, tbl = pcall(function() return HttpService:JSONDecode(raw) end)
+            if ok and type(tbl) == "table" then
+                return tbl[a.name] == want
+            end
+            return raw:find(tostring(want), 1, true) ~= nil
+        end, 2.5)
+
+    elseif a.type == "target" then
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then return false end
+        pcall(cmdTarget, m, a.mode)
+
+        local want = TARGET_NUM[a.mode]
+        if not want then return true end   -- โหมดที่ไม่รู้จัก ส่งแล้วผ่านเลย
+        return waitUntil(function()
+            return tonumber(tTargetMode(m)) == want
+        end, 2)
+
+    elseif a.type == "sell" then
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then return true end   -- ไม่มีอยู่แล้ว = ขายไปแล้ว
+        pcall(cmdSell, m)
+        if waitUntil(function() return m.Parent == nil end, 2.5) then
+            refModel[a.ref] = nil
+            modelRef[m] = nil
+            return true
+        end
+        return false
+
+    elseif a.type == "ability" then
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then return false end
+        pcall(cmdAbility, m, a.name, unpackValue(a.data))
+        --  สกิลไม่มีสัญญาณยืนยันที่อ่านได้ชัด ส่งครั้งเดียวแล้วผ่านไป
+        --  ส่งซ้ำเสี่ยงเปลืองคูลดาวน์มากกว่าได้ประโยชน์
+        return true
+
+    elseif a.type == "skip" then
+        --  ส่งซ้ำได้หลายครั้ง
+        --
+        --  เดิมผมคิดว่าโหวตเป็นปุ่มสลับ ส่งซ้ำแล้วจะยกเลิกโหวตตัวเอง จึงส่งครั้งเดียว
+        --  แต่ซอร์สของ VoteWave เขียนไว้ว่า "โหวตไปแล้วกดอีกไม่ได้"
+        --  (if u11 then return end) ส่งซ้ำจึงปลอดภัย ไม่ยกเลิกอะไรทั้งนั้น
+        --
+        --  ที่ต้องส่งซ้ำเพราะครั้งแรกอาจยิงตอนเวฟเพิ่งเริ่ม ยังไม่มีเมนูโหวตให้กด
+        --
+        --  เดิมส่งได้ 3 ครั้ง (15 วิ) เพราะตอนนั้นการโหวตยังขวางคิวหลักอยู่
+        --  รอนานกว่านั้นเท่ากับหยุดวาง/อัปเกรดทั้งมาโครไปด้วย จึงต้องรีบเลิก
+        --  ตอนนี้การโหวตแยกไปวิ่งสายของตัวเองแล้ว รอนานขึ้นไม่กระทบใคร
+        --  จากบันทึกจริง: เวฟ 14 ติดที่ครั้งที่ 3 พอดี ส่วนเวฟ 12 หมดโควตาก่อน
+        --  ทั้งที่เมนูเปิดอยู่ 0/1 — คือเซิร์ฟเวอร์ยังไม่เปิดรับ ไม่ใช่คำสั่งผิด
+        local w0 = getWave()
+
+        --  เวฟที่จะข้ามผ่านไปแล้ว โหวตตอนนี้จะไปตกในรอบของเวฟอื่น ซึ่งไม่ใช่สิ่งที่อัดไว้
+        --  เกิดได้เมื่อคำสั่งก่อนหน้าใช้เวลานานกว่าตอนอัด เช่นวางไม่สำเร็จแล้วลองซ้ำ
+        if w0 > (a.wave or 0) then
+            dlog("      skip: เวฟ %d ผ่านไปแล้ว (อัดไว้ที่ %d) ไม่ต้องโหวต",
+                w0, a.wave or 0)
+            return true
+        end
+
+        --  ต้องคร่อมด้วย if เพราะอาร์กิวเมนต์ถูกคำนวณก่อนเรียกฟังก์ชันเสมอ
+        --  ถ้าเขียน dlog(..., voteDump()) เฉยๆ ตัว voteDump จะกวาด PlayerGui
+        --  ทั้งก้อนทุกครั้งที่มีคำสั่ง skip ต่อให้ปิดบันทึกไว้ก็ตาม
+        if debugLog then
+            dlog("      skip: สำรวจเมนูโหวต\n        %s", voteDump())
+        end
+
+        --  ต้องรอให้เป็น "รอบโหวตใหม่" ก่อนค่อยส่ง ดูจากตัวนับที่กลับไปเป็น 0
+        --
+        --  ตอนเวฟ 1 เพิ่งเริ่ม เมนูยังค้างผลโหวต Ready ของเวฟ 0 อยู่ที่ 1/1
+        --  ส่งตอนนั้นเท่ากับโหวตซ้ำในรอบที่ปิดไปแล้ว เซิร์ฟเวอร์ไม่รับ
+        --  แล้วพอรอบจริงเปิด มาโครก็เดินหน้าไปคำสั่งอื่นแล้ว
+        --
+        --  รอได้ยาว เพราะรอบโหวตจะเปิดก็ต่อเมื่อถึงช่วงพัก ซึ่งกินเวลาเป็นนาที
+        --  ไม่ได้เสียเวลาเปล่า คำสั่งถัดไปถูกล็อกที่เวฟถัดไปอยู่แล้ว
+        local c0 = voteCount()
+        if c0 ~= 0 then
+            dlog("      skip: รอรอบโหวตใหม่ (ตอนนี้ %s เวฟ %d)", tostring(c0), w0)
+            waitUntil(function()
+                return voteCount() == 0 or getWave() > w0
+            end, 180)
+
+            if getWave() > w0 then
+                dlog("      skip: เวฟเดินเองเป็น %d ไม่ต้องโหวต", getWave())
+                return true
+            end
+            dlog("      skip: รอบใหม่เปิดแล้ว (%s)", tostring(voteCount()))
+        end
+
+        --  ส่งซ้ำจน "เวฟเดิน" ไม่ใช่จนครบจำนวนครั้งที่ตั้งไว้
+        --
+        --  ตัวเลขจากบันทึกจริงชี้ชัดว่าเซิร์ฟเวอร์ยังไม่เปิดรับในช่วงต้นเวฟ
+        --  ทั้งที่เมนูขึ้นแล้วและตัวนับเป็น 0/1:
+        --      เวฟ 12  ส่งที่วินาทีที่ 1 / 6 / 12 ของเวฟ แล้วเลิก → ไม่ติด
+        --      เวฟ 14  ส่งที่วินาทีที่ 11 / 16 / 21 ของเวฟ → ติดที่ครั้งสุดท้ายพอดี
+        --  ต่างกันแค่ "ส่งช้ากว่ากันสิบวินาที" คำสั่งเหมือนกันทุกตัวอักษร
+        --
+        --  การนับจำนวนครั้งจึงเป็นเกณฑ์ที่ผิดตั้งแต่แรก เพราะสิ่งที่รออยู่คือ
+        --  จังหวะที่เซิร์ฟเวอร์เปิดรับ ไม่ใช่จำนวนครั้งที่เรายิงไป
+        --  เลิกก็ต่อเมื่อเวฟเดินไปแล้ว (ซึ่งแปลว่าไม่มีอะไรให้ข้ามอีก)
+        --
+        --  รอยาวแบบนี้ได้เพราะการโหวตแยกไปวิ่งสายของตัวเองแล้ว ไม่มีใครรออยู่
+        local deadline = os.clock() + 150
+        local sends = 0
+
+        while playing and os.clock() < deadline do
+            if getWave() > w0 then
+                dlog("      skip: เวฟเดินเป็น %d แล้ว เลิกโหวต (ส่งไป %d ครั้ง)",
+                    getWave(), sends)
+                return true
+            end
+
+            local c0, need = voteCount()
+            sends = sends + 1
+            dlog("      skip: ส่งครั้งที่ %d | เวฟ %d (raw=%s) โหวต %s/%s อาร์กิวเมนต์เพิ่ม %d ตัว",
+                sends, w0, tostring(lastWaveText),
+                tostring(c0), tostring(need), a.extraN or 0)
+
+            pcall(cmdSkip, a)
+
+            --  สำเร็จได้สามแบบ: โหวตของเราขึ้น, เมนูปิดไปเลย, หรือเวฟเดินต่อเอง
+            local hit = waitUntil(function()
+                local c = voteCount()
+                if c == nil then return true end          -- เมนูปิด = จบช่วงโหวตแล้ว
+                if c0 and c > c0 then return true end     -- โหวตเราขึ้นแล้ว
+                return getWave() > w0
+            end, 5)
+
+            if hit then
+                local c, n2 = voteCount()
+                dlog("      skip: ติดแล้ว — โหวต %s/%s เวฟ %d (ส่งไป %d ครั้ง)",
+                    tostring(c), tostring(n2), getWave(), sends)
+                return true
+            end
+        end
+
+        --  หมดเวลาแล้วเวฟยังไม่ขยับ = เซิร์ฟเวอร์ไม่รับคำสั่งนี้จริงๆ
+        --  ไม่ใช่แค่เรื่องจังหวะ ต้องไปดักดูว่าปุ่มจริงส่งอะไรต่างจากเรา
+        local c, n2 = voteCount()
+        dlog("      skip: ส่งไป %d ครั้งใน %d วิ โหวตยังเป็น %s/%s เวฟ %d (raw=%s)",
+            sends, 150, tostring(c), tostring(n2), getWave(), tostring(lastWaveText))
+
+        --  เก็บเข้ารายงานด้วย ไม่งั้นมันหายไปกับ log 800 บรรทัด
+        --  แล้วเราจะไม่มีทางรู้ว่าโหวตพลาดที่เวฟไหนบ้าง
+        table.insert(failLog,
+            ("#? ข้ามเวฟ (อัดไว้ที่เวฟ %s)\n      โหวตไม่ติด: ส่งไป %d ครั้งจนหมดเวลา ตัวนับยังเป็น %s/%s"
+             .. "\n      ตอนนั้น: เวฟ %d · เมนูโหวต %s"
+             .. "\n      คิวหลักไม่ได้หยุดรอ การวาง/อัปเกรดเดินต่อตามปกติ")
+            :format(tostring(a.wave), sends, tostring(c), tostring(n2),
+                    getWave(), c and "เปิดอยู่" or "ไม่ได้เปิด"))
+
+        lastError = T("SKIP_NOMOVE", w0)
+        return true
+    end
+
+    return false
+end
+
+--  คำสั่งที่ต้องมีทาวเวอร์อยู่จริงถึงจะทำได้
+local NEEDS_REF = { upgrade = true, target = true, sell = true, ability = true, option = true }
+
+--  ยังไม่พร้อมยิงเพราะอะไร — คืน nil แปลว่าพร้อม
+--
+--  แยกออกมาจากการ "ลองแล้วไม่สำเร็จ" เพราะสองอย่างนี้ต่างกันโดยสิ้นเชิง
+--  การรอคือสถานการณ์ปกติที่เดี๋ยวก็ผ่าน ส่วนการลองแล้วพลาดคือสัญญาณว่ามีปัญหา
+--  ถ้านับเวลารวมกัน คำสั่งที่แค่รอเงินนานหน่อยจะถูกข้ามทั้งที่ไม่เคยได้ลองเลย
+local function holdReason(a, idx, total, tries)
+    if a.type == "place" then
+        local info = slotInfo(a.slot)
+
+        --  รอคูลดาวน์เฉพาะตอนที่ยิงไปแล้วพลาดมาก่อน
+        --
+        --  เดิมเช็คตั้งแต่ครั้งแรก ทำให้ทุกการวางเสียเวลารอโดยไม่จำเป็น
+        --  และผมยังไม่ได้ยืนยันด้วยซ้ำว่า Timeleft ของช่องทาวเวอร์คือคูลดาวน์วางจริง
+        --  ถ้าอ่านผิดก็จะรอเก้อทั้งที่วางได้ตั้งนานแล้ว
+        --
+        --  ยิงก่อนแล้วค่อยรอเมื่อพลาด จึงเร็วในกรณีปกติและยังฉลาดตอนติดคูลดาวน์
+        --  เพดาน 120 กันกรณีที่ค่านั้นไม่ใช่คูลดาวน์ แล้วเราจะรอไม่จบ
+        if tries > 0 and info and info.cooldown > 0 and info.cooldown < 120 then
+            return T("WAIT_CD", idx, total, info.cooldown)
+        end
+        --  รอเงินเป็นพฤติกรรมพื้นฐานเสมอ ไม่มีสวิตช์ปิด
+        --  ยิงตอนเงินไม่พอคือส่งของที่เซิร์ฟเวอร์ปฏิเสธแน่นอน ไม่มีข้อดีเลย
+        --
+        --  ราคาสดจากช่องทาวเวอร์มาก่อนเสมอ ราคาที่อัดไว้เป็นแค่ตัวสำรอง
+        --
+        --  เดิมเลือก "ตัวที่น้อยกว่า" ระหว่างสองค่า ด้วยเหตุผลว่าถ้าเลขช่องเพี้ยน
+        --  มาโครจะได้ไม่รอเงินที่ไม่มีวันถึง แต่กลายเป็นเปิดช่องให้ราคาที่อัดเพี้ยนต่ำ
+        --  มาลากทุกอย่างพังแทน — log จริง: จดไว้ 81 ทั้งที่ Scout ราคา 250
+        --  มาโครเลยรอแค่ $81 แล้วยิงตอนมี $132 โดนปฏิเสธสองครั้งติดจนเลิกลอง
+        --
+        --  ราคาสดอ่านจากช่องในเกมตอนนั้นจริงๆ สะท้อนทั้งสกินและบัฟส่วนลด
+        --  ไม่มีทางเพี้ยนแบบราคาที่อัดไว้ ซึ่งมาจากการคำนวณย้อนหลังของสคริปต์เอง
+        local live = (info and info.cost and info.cost > 0) and info.cost or nil
+        local need = live or a.cost or 0
+        local c = getCash()
+        if c and need > 0 and c < need then
+            return T("WAIT_CASH", idx, total, need, c)
+        end
+        return nil
+    end
+
+    --  อัปเกรด: ใช้ราคาสดจากโมดูลเกมก่อนเสมอ ถ้าอ่านได้
+    --
+    --  ราคาที่อัดไว้เป็นตัวสำรอง ไม่ใช่ตัวหลักอีกต่อไป
+    --  มันเพี้ยนสูงเกินจริงได้ง่ายมาก แล้วมาโครจะนั่งรอเงินที่ไม่เคยต้องใช้
+    --  บันทึกรอบล่าสุดเสียเวลาแบบนี้ไปเจ็ดครั้ง รวมราวร้อยวินาที
+    local need = a.cost or 0
+    if a.type == "upgrade" then
+        local m = refModel[a.ref]
+        local live = (m and m.Parent) and upgradeCost(m) or nil
+        if live then
+            --  ราคาในโมดูลเป็น "ราคาป้าย" ยังไม่หักส่วนลด
+            --  ส่วน a.cost มาจาก @TotalSpent = เงินที่จ่ายจริงรอบก่อน ซึ่งหักแล้ว
+            --  (log จริง: ป้าย 2400 จ่ายจริง 2040 ต่างกัน 15% ทุกครั้ง)
+            --  เอาตัวที่ต่ำกว่า จะได้ไม่รอเงินส่วนที่ไม่ต้องจ่าย
+            --  ถ้าส่วนลดหายไปแล้วยิงพลาด ตัวรอเงินจะพากลับมาลองใหม่เอง ไม่เสียหาย
+            need = (need > 0) and math.min(need, live) or live
+        end
+    end
+
+    if need > 0 then
+        local c = getCash()
+        if c and c < need then
+            return T("WAIT_CASH", idx, total, need, c)
+        end
+    end
+    return nil
+end
+
+--  ลองซ้ำจนกว่าจะสำเร็จ หรือหมดงบเวลา "ที่ใช้ลองจริง" แล้วข้าม
+local function runAction(a, idx, total)
+    --  ชนกฎจำนวนสูงสุดของทาวเวอร์ชนิดนั้นแล้ว ยิงไปก็โดนปฏิเสธแน่นอน
+    --  ข้ามทันทีดีกว่าเสียเวลาลองสี่ครั้ง แล้วไปกินจังหวะของคำสั่งข้างหลัง
+    --  ลิมิตอ่านจากโมดูลของเกมได้เลย (Stats.Default.Defaults.Limit)
+    --  ไม่ต้องรอให้ถูกปฏิเสธหนึ่งครั้งก่อนถึงจะรู้เหมือนเมื่อก่อน
+    if a.type == "place" and a.tower and towerLimit[a.tower] == nil then
+        local d = towerDefaults(a.tower)
+        local lim = d and tonumber(d.Limit)
+        if lim and lim > 0 then
+            towerLimit[a.tower] = lim
+            dlog("   ลิมิตจากโมดูลเกม: %s สูงสุด %d ตัว", a.tower, lim)
+        end
+    end
+
+    if a.type == "place" and a.tower and towerLimit[a.tower] then
+        local have = countOfType(a.tower)
+        if have >= towerLimit[a.tower] then
+            dlog("   ข้าม: %s มีครบลิมิตแล้ว (%d/%d)",
+                a.tower, have, towerLimit[a.tower])
+            lastReply = ("ชนลิมิต %s สูงสุด %d ตัว")
+                :format(a.tower, towerLimit[a.tower])
+            a.impossible = true
+            return false
+        end
+    end
+
+    --  ทาวเวอร์ที่วางไม่ขึ้นตั้งแต่แรก คำสั่งที่อ้างถึงมันไม่มีวันสำเร็จ
+    --  ต้องข้ามทันที ไม่ใช่วนลองอีก 45 วินาทีแล้วค่อยยอมแพ้
+    --  จุดนี้แหละที่ทำให้มาโครช้าและอัปเกรดหายเป็นแถบ
+    if NEEDS_REF[a.type] then
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then
+            --  ยังไม่ยอมแพ้ทันที ลองตามหาจากตำแหน่งที่อัดไว้ก่อน
+            --  ทาวเวอร์อาจถูกวางสำเร็จจริงแต่เราจับคู่ไม่ได้ตอนนั้น
+            m = recoverRef(a.ref)
+            if m then
+                dlog("      กู้คืน ref %s ได้จากตำแหน่งที่อัดไว้", tostring(a.ref))
+            else
+                --  ขายของที่ไม่มีอยู่ = ผลลัพธ์ตรงกับที่ต้องการอยู่แล้ว
+                return a.type == "sell", true
+            end
+        end
+    end
+
+    --  ซ่อมราคาที่อัดไว้ให้ตรงกับความจริง แล้วบันทึกทับตอนจบ
+    --
+    --  ไฟล์ที่เล่นด้วยรุ่นก่อนหน้ามีราคาเพี้ยนติดอยู่ (เช่น Scout 81 ทั้งที่ราคา 250)
+    --  ต่อให้ตอนนี้เราไม่ใช้เลขนั้นแล้ว ก็ควรล้างให้หมด ไม่ปล่อยข้อมูลผิดค้างในไฟล์
+    --  อัปเกรดไม่เขียนทับ a.cost ด้วยราคาจากโมดูล
+    --
+    --  เคยเขียนทับแล้วเกิดสงคราม: ตอนเริ่มคำสั่งเขียน 2400 ทับ 2040
+    --  พอจ่ายเสร็จตัววัด @TotalSpent ก็เขียน 2040 ทับกลับ วนแบบนี้ทุกคำสั่ง
+    --  รอบเดียวแก้ไป 97 รายการแล้วบันทึกไฟล์ใหม่ทุกครั้งที่เล่น ทั้งที่ไม่มีอะไรผิด
+    --  สองค่านี้ไม่ได้ขัดกัน — อันหนึ่งคือราคาป้าย อีกอันคือเงินที่จ่ายจริงหลังหักส่วนลด
+    --  เก็บ "เงินที่จ่ายจริง" ไว้ในไฟล์อย่างเดียว ส่วนราคาป้ายอ่านสดตอนใช้งานพอ
+    if a.type == "upgrade" then
+        if debugLog then
+            local m = refModel[a.ref]
+            local live = (m and m.Parent) and upgradeCost(m) or nil
+            if live and live ~= (a.cost or 0) then
+                dlog("   ราคาป้ายในโมดูล: %d · ที่จ่ายจริงรอบก่อน: %s",
+                    live, tostring(a.cost))
+            end
+        end
+
+    elseif a.type == "place" then
+        local info = slotInfo(a.slot)
+        local live = (info and info.cost and info.cost > 0) and info.cost or nil
+        if live and live ~= (a.cost or 0) then
+            dlog("   ราคาสดจากช่องทาวเวอร์: %d (ที่อัดไว้ %s) — แก้ในไฟล์ให้ด้วย",
+                live, tostring(a.cost))
+            a.cost = live
+            costFixed = costFixed + 1
+        end
+    end
+
+    --  เก็บรายชื่อทาวเวอร์ก่อนเริ่ม ครั้งเดียวต่อคำสั่ง ไม่ใช่ต่อครั้งที่ลอง
+    --  ถ้าเก็บใหม่ทุกครั้ง ตัวที่ครั้งก่อนวางสำเร็จแต่เราตรวจไม่ทันเวลา
+    --  จะถูกมองว่าเป็นของเก่า แล้วเราจะสั่งวางซ้ำอีกใบ เปลืองเงินและชนลิมิต
+    local before
+    if a.type == "place" then
+        before = {}
+        local f = towersFolder()
+        if f then
+            for _, m in ipairs(f:GetChildren()) do before[m] = true end
+        end
+    end
+
+    --  จำกัดจำนวน "ครั้งที่ลองจริง" ด้วย ไม่ใช่จำกัดแค่เวลา
+    --
+    --  การรอเงินหรือรอคูลดาวน์ไม่นับเป็นการลอง ดังนั้นถ้าลองจริงไปหลายครั้ง
+    --  ในสภาพที่เงินพอและไม่ติดคูลดาวน์แล้วยังไม่สำเร็จ แปลว่าติดเหตุผลถาวร
+    --  เช่นจุดนั้นมีของวางอยู่แล้ว หรือชนลิมิตจำนวนทาวเวอร์ชนิดนั้น
+    --  ลองต่อไปจนครบ 45 วินาทีก็ไม่มีทางสำเร็จ มีแต่ทำให้คำสั่งข้างหลังพลาดจังหวะ
+    --  โดยเฉพาะโหวตข้ามเวฟที่มีหน้าต่างเวลาจำกัด
+    local MAX_TRIES = 4
+
+    --  ราคาที่อัดไว้เชื่อไม่ได้ 100%
+    --
+    --  มาโครที่อัดไว้ก่อนหน้านี้วัดราคาอัปเกรดด้วยการอ่านยอดหลังหน่วงเวลา
+    --  ถ้าตอนอัดรัวอัปเกรดตัวเดียวกันหลายครั้ง ราคาครั้งแรกจะกลายเป็น
+    --  ยอดรวมของทั้งชุด สูงเกินจริงหลายเท่า แล้วมาโครจะนั่งรอเงินที่ไม่เคยต้องใช้
+    --  จนกว่าจะบังเอิญมีเงินถึงยอดนั้นจริงๆ ซึ่งมักเป็นช่วงท้ายเกม
+    --
+    --  ทางแก้: รอเงินได้ แต่รอนานเกินนี้แล้วให้ลองยิงดูสักครั้ง
+    --  ถ้าราคาที่จดไว้ผิดจริง คำสั่งจะผ่าน แล้วเราจะแก้ตัวเลขให้เองด้านล่าง
+    --  ถ้าเงินไม่พอจริง เซิร์ฟเวอร์ก็แค่ปฏิเสธ ไม่มีอะไรเสียหาย
+    local CASH_PATIENCE = 12
+
+    local tries    = 0
+    local tried    = 0                              -- เวลาที่ใช้ลองจริงเท่านั้น
+    local refusals = 0                              -- โดนปฏิเสธแบบชัดเจนกี่ครั้ง
+    local waited   = 0                              -- รอเงินมานานแค่ไหนแล้ว
+    local lastHold = nil
+    local hardStop = os.clock() + actionTimeout * 4 -- กันค้างถาวรถ้าเงื่อนไขไม่มาสักที
+
+    while playing and tries < MAX_TRIES
+        and tried < actionTimeout and os.clock() < hardStop do
+        local hold = holdReason(a, idx, total, tries)
+
+        --  รอเงินมานานเกินไปแล้ว ให้โอกาสยิงหนึ่งครั้งเพื่อพิสูจน์ว่าราคาที่จดไว้ถูกไหม
+        if hold and waited >= CASH_PATIENCE then
+            dlog("      รอเงินมา %.0f วิแล้ว ลองยิงดูว่าราคาที่จดไว้ (%s) สูงเกินจริงไหม",
+                waited, tostring(a.cost))
+            waited = 0
+            hold = nil
+        end
+
+        if hold then
+            --  จดเฉพาะตอนเหตุผลเปลี่ยน ไม่งั้นบันทึกจะท่วมด้วยบรรทัดเดิมซ้ำๆ
+            if hold ~= lastHold then
+                lastHold = hold
+                dlog("      รอ: %s", hold)
+            end
+            status = hold
+            waited = waited + 0.3
+            task.wait(0.3)
+        else
+            lastHold = nil
+            tries = tries + 1
+            status = T("DOING", idx, total, actionLabel(a),
+                tries > 1 and T("ATTEMPT", tries) or "")
+
+            local t0 = os.clock()
+            local ok, refused = tryOnce(a, before, tries)
+            tried = tried + (os.clock() - t0)
+
+            --  ได้ราคาจริงจากเซิร์ฟเวอร์มาแล้ว ใช้ตัวนี้ก่อนเสมอ
+            --
+            --  ราคาอัปเกรดที่อัดไว้เพี้ยนได้ง่ายมาก ตอนอัดถ้ารัวอัปเกรดตัวเดียวกัน
+            --  หลายครั้งติดกัน ราคาครั้งแรกจะกลายเป็นยอดรวมของทั้งชุด
+            --  จากบันทึกรอบที่แล้ว: จด 2500 แต่จ่ายจริงราว 1300, จด 3240 จ่ายจริงราว 2500
+            --  ส่วนต่างนั้นแปลว่ามาโครนั่งรอเงินที่ไม่เคยต้องใช้ ครั้งละ 12-20 วินาที
+            --  รอบที่แล้วเสียไปแบบนี้ 7 ครั้ง รวมราวร้อยวินาที
+            --
+            --  แก้ตรงนี้แล้วบันทึกทับตอนจบ รอบหน้าจะไม่เจอชุดนี้อีกเลย
+            local paid = paidOf[a]
+            paidOf[a] = nil
+            if ok and paid and paid ~= (a.cost or 0) then
+                dlog("      ราคาจริงจากเซิร์ฟเวอร์: %d (ที่จดไว้ %s) — แก้ให้แล้ว",
+                    paid, tostring(a.cost))
+                a.cost = paid
+                costFixed = costFixed + 1
+            end
+
+            --  เคยมีทางที่สามอยู่ตรงนี้: เดาราคาจากยอดเงินก่อน-หลัง
+            --
+            --  ถอดออกแล้วเพราะมันเป็นตัวที่ทำไฟล์มาโครพัง ป้ายเงินมาช้ากว่าความจริง
+            --  และฟาร์มก็จ่ายเงินเข้ามาตลอดเวลา ลบกันแล้วได้ 81 ทั้งที่ Scout ราคา 250
+            --  แล้วเลขผิดนั้นถูกบันทึกทับลงไฟล์ กลายเป็นความเสียหายถาวร
+            --
+            --  ตอนนี้ราคาทุกชนิดมาจากแหล่งที่เชื่อได้แล้ว ไม่ต้องเดาอีก:
+            --    อัปเกรด  @TotalSpent ของทาวเวอร์ + ตารางราคาในโมดูลเกม
+            --    วาง      ราคาสดจากช่องทาวเวอร์ในเกม
+
+            --  ถูกปฏิเสธแบบชัดเจนสองครั้งติด = เหตุผลถาวร (จุดนั้นมีของ / ชนลิมิต)
+            --  ยิงต่อไม่มีทางสำเร็จ
+            if refused then
+                refusals = refusals + 1
+                if refusals >= 2 then
+                    dlog("      เซิร์ฟเวอร์ปฏิเสธ %d ครั้งติด เลิกลอง", refusals)
+                    break
+                end
+            end
+            dlog("      ลองครั้งที่ %d -> %s (ใช้งบไป %.1f/%d วิ)",
+                tries, ok and "สำเร็จ" or "พลาด", tried, actionTimeout)
+            if ok then return true end
+
+            task.wait(cmdDelay)
+            tried = tried + cmdDelay
+        end
+    end
+
+    return false
+end
+
+--  ── สายสกิล ───────────────────────────────────────────────
+--
+--  สกิลถูกแยกออกมาจากคิวหลัก เพราะสองอย่างนี้ต้องการคนละอย่าง
+--    คำสั่งอื่น  สำคัญที่ "ลำดับ" — ต้องวางก่อนถึงจะอัปเกรดได้
+--    สกิล        สำคัญที่ "จังหวะ" — กดตอนบอสออก ไม่ใช่กดเมื่อถึงคิว
+--
+--  ถ้าอยู่คิวเดียวกัน การรอจังหวะกดสกิลจะไปหน่วงการอัปเกรดที่ควรทำได้เลย
+--  และการรีบทำตามคิวก็จะทำให้สกิลถูกกดก่อนบอสออก ซึ่งเสียเปล่าทั้งคู่
+--
+--  จังหวะยึดจาก "วินาทีที่เท่าไหร่ของเวฟนั้น" ไม่ใช่เวลารวมตั้งแต่เริ่มเกม
+--  เพราะตอนเล่นซ้ำเวลารวมเลื่อนเสมอจากการรอเงินและรอโหวต
+local waveStart = {}       -- เวฟ → os.clock ตอนที่เวฟนั้นเริ่ม (ระหว่างเล่น)
+
+local function watchWavesWhilePlaying()
+    task.spawn(function()
+        local last = getWave()
+        waveStart[last] = os.clock()
+        while playing do
+            local w = getWave()
+            if w ~= last then
+                last = w
+                waveStart[w] = os.clock()
+            end
+            task.wait(0.2)
+        end
+    end)
+end
+
+--  บัฟที่ยังทำงานอยู่จะนับถอยหลังใน @Ammo (เห็นชัดใน log ของ Commander: 10 → 0)
+--  ทาวเวอร์ที่ไม่ได้ใช้ระบบนี้จะมี @MaxAmmo = 0 เช่น DJ Booth
+local function buffRunning(m)
+    local r = rep(m)
+    if not r then return false end
+    local maxA = tonumber(r:GetAttribute("MaxAmmo")) or 0
+    local now  = tonumber(r:GetAttribute("Ammo")) or 0
+    return maxA > 0 and now > 0
+end
+
+--  บัฟของทาวเวอร์ชนิดเดียวกัน "ตัวไหนก็ได้" ยังทำงานอยู่ไหม
+--
+--  เดิมผมเช็คแค่ตัวที่กำลังจะกด ซึ่งผิดโจทย์ — ปัญหาไม่ใช่กดตัวเดิมซ้ำ
+--  แต่คือกด Commander ตัวที่ 2 ตอนบัฟของตัวที่ 1 ยังอยู่ เกมนี้บัฟทับกันไม่ได้
+--  ตัวที่กดทีหลังจึงเสียเปล่า ต้องรอให้ของทุกตัวหมดก่อนถึงจะกดตัวถัดไป
+--
+--  ดูจากค่าจริงในเกม ไม่ใช่นับเวลาเอง คูลดาวน์จะเร็วหรือช้ากว่าปกติก็ยังถูก
+local function anyBuffRunning(name)
+    local f = towersFolder()
+    if not (f and name) then return false end
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) and tName(m) == name and buffRunning(m) then
+            return true
+        end
+    end
+    return false
+end
+
+local function runAbilityTrack(list)
+    for _, a in ipairs(list) do
+        if not playing then break end
+
+        --  รอให้ถึงเวฟของสกิลนี้ก่อน
+        while playing and getWave() < (a.wave or 0) do task.wait(0.3) end
+        if not playing then break end
+
+        --  ต้องหาทาวเวอร์ให้เจอก่อน เพราะการรอ "บอสเข้าระยะ" ต้องรู้ว่าวัดจากตรงไหน
+        --  ทาวเวอร์อาจยังไม่ถูกวางโดยสายหลัก รอสักพักแล้วลองตามหา
+        local m = refModel[a.ref]
+        if not (m and m.Parent) then
+            local until_ = os.clock() + 10
+            repeat
+                task.wait(0.3)
+                m = refModel[a.ref] or recoverRef(a.ref)
+            until (m and m.Parent) or not playing or os.clock() > until_
+        end
+
+        --  ตอนอัดกดตอนบอสอยู่ในสนาม → รอ "บอสเข้าระยะ" ก่อน
+        --
+        --  แค่บอสโผล่ยังไม่พอ ตอนบอสเพิ่งเกิดมันอยู่ท้ายทางเดิน ห่างเป็นสิบสตัด
+        --  ยิงคลื่นเสียงตอนนั้นคือทิ้งคูลดาวน์เปล่าๆ กว่าบอสจะเดินมาถึงก็หมดฤทธิ์แล้ว
+        --
+        --  ระยะอ่านจาก @Range ซึ่งเป็นค่าสดตามระดับปัจจุบัน (รวมบัฟระยะด้วย)
+        --  ตำแหน่งบอสอ่านจากโมเดลจริงในโลก ทั้งสองอย่างเปลี่ยนตามเวลาได้อิสระ
+        --  จึงเช็คใหม่ทุกรอบ ไม่ได้คำนวณครั้งเดียวแล้วจำไว้
+        --
+        --  ถ้าอ่านระยะไม่ได้ (เกมเปลี่ยนโครงสร้าง) ถอยไปใช้เกณฑ์เดิมคือ "บอสโผล่"
+        --  ดีกว่าไม่ยิงเลยเพราะรอเงื่อนไขที่ไม่มีวันอ่านได้
+        if abilityTiming and a.boss and getWave() == a.wave then
+            --  "อ่านระยะได้ไหม" ต้องดูที่ @Range ของทาวเวอร์อย่างเดียว
+            --
+            --  รอบที่แล้วผมเช็คด้วย bossInRange(m) ~= nil ซึ่งผิด
+            --  ฟังก์ชันนั้นคืน nil ทั้งตอน "อ่านระยะไม่ได้" และตอน "ยังไม่มีบอสในสนาม"
+            --  พอเช็คตอนเวฟเพิ่งเริ่มซึ่งบอสยังไม่เกิด มันเลยสรุปว่าอ่านระยะไม่ได้ทุกครั้ง
+            --  แล้วถอยไปใช้เกณฑ์เดิมตลอด — ฟีเจอร์ระยะจึงไม่เคยได้ทำงานเลยสักครั้ง
+            local canRange = (m and m.Parent) and tRange(m) ~= nil
+
+            if canRange then
+                local inR, d, rng = bossInRange(m)
+                if not inR then
+                    dlog("สกิล %s: รอบอสเข้าระยะ %.1f (ตอนนี้ %s) เวฟ %s",
+                        tostring(a.name), tRange(m) or -1,
+                        d and ("ห่าง %.1f"):format(d) or "ยังไม่มีบอสในสนาม",
+                        tostring(a.wave))
+
+                    local until_ = os.clock() + 150
+                    while playing and getWave() == a.wave and os.clock() < until_ do
+                        if bossInRange(m) then break end
+                        task.wait(0.15)
+                    end
+
+                    local hit, d2 = bossInRange(m)
+                    if hit then
+                        dlog("สกิล %s: บอสเข้าระยะแล้ว (ห่าง %.1f)",
+                            tostring(a.name), d2 or -1)
+                    else
+                        dlog("สกิล %s: รอจนหมดเวลาแล้วบอสไม่เข้าระยะ ยิงเลยดีกว่าไม่ได้ยิง",
+                            tostring(a.name))
+                    end
+                end
+
+            elseif not bossOnField() then
+                dlog("สกิล %s: อ่านระยะไม่ได้ ใช้เกณฑ์เดิม — รอบอสโผล่ (เวฟ %s)",
+                    tostring(a.name), tostring(a.wave))
+                local until_ = os.clock() + 120
+                while playing and not bossOnField() and getWave() == a.wave
+                    and os.clock() < until_ do
+                    task.wait(0.2)
+                end
+            end
+        end
+
+        --  รอให้ถึงวินาทีเดียวกับตอนอัด นับจากต้นเวฟนั้น
+        --  เวฟผ่านไปแล้วก็ไม่ต้องรอ ยิงเลยดีกว่าไม่ได้ยิง
+        if abilityTiming and a.tw and not a.boss and getWave() == a.wave then
+            local st = waveStart[a.wave]
+            if st then
+                while playing do
+                    local into = os.clock() - st
+                    if into >= a.tw or getWave() > a.wave then break end
+                    task.wait(0.15)
+                end
+            end
+        end
+        if not playing then break end
+
+        --  ตั้งตัวเลือกให้ตรงกับตอนอัดก่อนยิง
+        --
+        --  คำสั่งเลือกตัวเลือกอยู่ในคิวหลัก ส่วนสกิลอยู่คนละสาย
+        --  ไม่มีอะไรรับประกันว่าคิวหลักจะตั้งทันก่อนสกิลถึงเวลายิง
+        --  ถ้าไม่ตรงก็ตั้งเองตรงนี้เลย ดีกว่ายิงไปแล้วได้เอฟเฟกต์ผิดตัว
+        --  ทาวเวอร์ยังอัปเกรดไม่ถึงระดับที่สกิลนี้ต้องการ กดไปก็ไม่มีอะไรเกิด
+        --  โมดูลเกมบอกระดับไว้ (เช่น Red Track ต้อง Level 2) ใช้ข้อมูลนั้นเลย
+        if m and m.Parent then
+            local need
+            local d = towerDefaults(tName(m))
+            for _, ab in ipairs((d and d.Abilities) or {}) do
+                if ab.Name == a.name then need = tonumber(ab.Level) end
+            end
+            if need and need > 0 and tLevel(m) < need then
+                dlog("สกิล %s: ข้าม — %s ยังอัปเกรดไม่ถึงระดับ %d (ตอนนี้ %d)",
+                    tostring(a.name), tName(m), need, tLevel(m))
+                m = nil
+            end
+        end
+
+        if m and m.Parent and a.opts then
+            local okDecode, want = pcall(function()
+                return HttpService:JSONDecode(a.opts)
+            end)
+
+            if okDecode and type(want) == "table" then
+                for k, v in pairs(want) do
+                    if not playing then break end
+
+                    local r0 = rep(m)
+                    local raw = r0 and r0:GetAttribute("Options")
+                    local cur
+                    if type(raw) == "string" and raw ~= "" then
+                        local ok2, t = pcall(function() return HttpService:JSONDecode(raw) end)
+                        cur = (ok2 and type(t) == "table") and t[k] or nil
+                    end
+
+                    if cur ~= v then
+                        dlog("สกิล %s: ตั้ง %s = %s ก่อน (ตอนนี้เป็น %s)",
+                            tostring(a.name), tostring(k), tostring(v), tostring(cur))
+                        pcall(cmdOption, m, k, v)
+
+                        --  รอให้ผลมาถึงก่อน ไม่งั้นยิงตอนตัวเลือกยังไม่เปลี่ยน
+                        local until_ = os.clock() + 3
+                        while playing and os.clock() < until_ do
+                            local r1 = rep(m)
+                            local raw1 = r1 and r1:GetAttribute("Options")
+                            if type(raw1) == "string" and raw1:find(tostring(v), 1, true) then
+                                break
+                            end
+                            task.wait(0.1)
+                        end
+                    end
+                end
+            end
+        end
+
+        if m and m.Parent then
+            --  รอให้บัฟของทาวเวอร์ชนิดเดียวกัน "ทุกตัว" หมดก่อน
+            --  นี่คือการหมุนบัฟของ Commander — กดตัวที่ 2 ตอนบัฟตัวที่ 1 ยังอยู่
+            --  ไม่ได้ทำให้บัฟแรงขึ้น แต่ทำให้ตัวที่ 2 เสียเปล่าไปเลย
+            local kind = tName(m)
+            local waitBuff = os.clock() + 60
+            while playing and anyBuffRunning(kind) and os.clock() < waitBuff do
+                task.wait(0.3)
+            end
+
+            pcall(cmdAbility, m, a.name, unpackValue(a.data))
+            dlog("สกิล: %s ที่เวฟ %s (วินาทีที่ %.1f ของเวฟ)",
+                tostring(a.name), tostring(a.wave), tonumber(a.tw) or -1)
+        else
+            dlog("สกิล: %s ข้าม — ไม่เจอทาวเวอร์ ref %s",
+                tostring(a.name), tostring(a.ref))
+        end
+    end
+end
+
+--  โหวตข้ามเวฟแยกไปวิ่งสายของตัวเอง
+--
+--  เดิมการโหวตอยู่ในคิวหลัก พอเซิร์ฟเวอร์ไม่รับ มาโครจะยืนส่งซ้ำอยู่ 15 วินาที
+--  โดยที่การวางและอัปเกรดทั้งหมดหยุดรออยู่ข้างหลัง เงินกองอยู่แต่ไม่ได้ใช้
+--  ทั้งที่การข้ามเวฟไม่ได้เป็นเงื่อนไขของคำสั่งไหนเลย — คำสั่งถัดไปดูที่เลขเวฟ
+--  ซึ่งเดินเองอยู่แล้วไม่ว่าจะโหวตติดหรือไม่
+--
+--  ผลคือรอบที่โหวตพลาด อัปเกรดที่ควรได้ในเวฟนั้นถูกเบียดไปเวฟถัดไป
+--  บางตัวจึงค้างอยู่ระดับต่ำกว่าที่อัดไว้จนจบเกม
+--
+--  แยกออกมาแล้วสองอย่างนี้ไม่แย่งเวลากัน และยังส่งซ้ำได้นานขึ้นด้วย
+local function runSkipTrack(list)
+    for _, a in ipairs(list) do
+        if not playing then break end
+
+        --  รอให้ถึงเวฟที่อัดไว้ก่อน — รอเสมอ ไม่ว่าจะปิด "รอถึงเวฟ" ไว้หรือไม่
+        --
+        --  ปิด "รอถึงเวฟ" คือบอกว่า "มีเงินแล้ววางเลย ไม่ต้องรอเวฟ" ซึ่งเร่งเกมได้จริง
+        --  แต่การโหวตไม่มีอะไรให้เร่ง โหวตข้ามเวฟ 12 ตอนเกมอยู่เวฟ 10
+        --  ไม่ได้ทำให้เร็วขึ้น มันไปตกในรอบของเวฟ 10 แทน = เสียโหวตทิ้งเปล่า
+        --
+        --  และการรอตรงนี้ไม่ได้ถ่วงใคร เพราะอยู่คนละสายกับคิวหลักแล้ว
+        while playing and getWave() < (a.wave or 0) do task.wait(0.3) end
+        if not playing then break end
+
+        --  เรียก tryOnce ตรงๆ ไม่ผ่าน runAction เพราะ runAction เป็นตัวจัดการ
+        --  งบเวลา/การรอเงิน/การลองซ้ำของ "คิวหลัก" ซึ่งการโหวตไม่ต้องใช้เลย
+        --  ตัวการส่งซ้ำอยู่ในบล็อก skip ของ tryOnce อยู่แล้ว
+        dlog("โหวตข้ามเวฟ: ถึงเวฟ %s แล้ว เริ่มโหวต", tostring(a.wave))
+        pcall(tryOnce, a, nil, 1)
+    end
+end
+
+-- ── หมุนบัฟอัตโนมัติ ──────────────────────────────────────
+--
+--  ต่างจากมาโครตรงที่ไม่ได้เล่นตามที่อัดไว้ แต่วนกดเองไม่รู้จบ
+--  เหมาะกับทาวเวอร์บัฟอย่าง Commander ที่วางหลายตัวแล้วต้องหมุนกันไปเรื่อยๆ
+--
+--  ชื่อสกิลไม่ได้ฝังไว้ในโค้ด — ดึงจากมาโครที่โหลดอยู่
+--  มาโครบอกอยู่แล้วว่าทาวเวอร์ชนิดไหนใช้สกิลชื่ออะไร ไม่ต้องให้ผู้ใช้มากรอกเอง
+--  และถ้าเกมเปลี่ยนชื่อสกิล อัดใหม่ครั้งเดียวก็ตามทัน
+--  ทาวเวอร์ชนิดไหนมีสกิลอะไรบ้าง — ดึงจากมาโครที่โหลดอยู่
+--  ไม่ฝังชื่อไว้ในโค้ด เกมเปลี่ยนชื่อสกิลเมื่อไหร่ อัดใหม่ครั้งเดียวก็ตามทัน
+--  ทาวเวอร์ชนิดไหนมีสกิลชื่ออะไรบ้าง — เก็บ "ทุกชื่อ" ไม่ใช่ชื่อเดียว
+--
+--  Commander มีสองสกิล: Call Of Arms (บัฟ) กับ Support Caravan (เรียกรถถัง 2000฿)
+--  ถ้าเก็บชื่อเดียวแล้วบังเอิญได้ Support Caravan ระบบหมุนจะเผาเงินรอบละ 2000
+local function abilityNamesOf(kind)
+    local out, seen = {}, {}
+    if not (macro and kind) then return out end
+
+    local placeName = {}
+    for _, a in ipairs(macro.actions) do
+        if a.type == "place" and a.ref then placeName[a.ref] = a.tower end
+    end
+    for _, a in ipairs(macro.actions) do
+        if a.type == "ability" and a.name and placeName[a.ref] == kind
+            and not seen[a.name] then
+            seen[a.name] = true
+            table.insert(out, a.name)
+        end
+    end
+
+    --  มาโครที่อัดตอนเปิดหมุนบัฟไว้จะไม่มี action สกิลเลย
+    --  เพราะการกดของเราเองถูกกรองออกด้วย checkcaller() ต้องอ่านจากที่จดไว้แทน
+    --
+    --  ต้องกันสตริงว่างด้วย มาโครรุ่นเก่าจด ability = "" ติดไปทุกไฟล์
+    --  (ตัวแปรต้นทางไม่เคยถูกกำหนดค่าเลย) ถ้าปล่อยผ่าน ระบบหมุนบัฟจะได้ชื่อสกิลว่าง
+    --  ไปไว้หัวรายการ แล้วเสียรอบไปหนึ่งครั้งกับการยิงสกิลที่ไม่มีอยู่จริง
+    local saved = macro.autoBuff and macro.autoBuff.kind == kind
+        and macro.autoBuff.ability
+    if type(saved) == "string" and saved ~= "" and not seen[saved] then
+        table.insert(out, 1, saved)
+    end
+    return out
+end
+
+--  ชนิดทาวเวอร์ที่มีสกิลอัดไว้ เอาไว้เดาว่าจะหมุนของอะไร
+local function kindsWithAbility()
+    local out, seen = {}, {}
+    if not macro then return out end
+
+    local placeName = {}
+    for _, a in ipairs(macro.actions) do
+        if a.type == "place" and a.ref then placeName[a.ref] = a.tower end
+    end
+    for _, a in ipairs(macro.actions) do
+        local kind = a.type == "ability" and placeName[a.ref]
+        if kind and not seen[kind] then
+            seen[kind] = true
+            table.insert(out, kind)
+        end
+    end
+    if macro.autoBuff and macro.autoBuff.kind and not seen[macro.autoBuff.kind] then
+        table.insert(out, macro.autoBuff.kind)
+    end
+    return out
+end
+
+
+--  เรียงตามลำดับที่วาง (@CreatedAt) ไม่ใช่ลำดับใน workspace
+--  ลำดับใน workspace เปลี่ยนได้เมื่อมีตัวถูกขายหรือถูกทำลาย
+--  ถ้ายึดตามนั้น การหมุนจะสลับมั่วแล้วบางตัวไม่เคยได้กดเลย
+local function towersOfType(kind)
+    local f = towersFolder()
+    local out = {}
+    if not (f and kind) then return out end
+
+    for _, m in ipairs(f:GetChildren()) do
+        if isMine(m) and tName(m) == kind then table.insert(out, m) end
+    end
+    table.sort(out, function(x, y)
+        local rx, ry = rep(x), rep(y)
+        local ax = rx and tonumber(rx:GetAttribute("CreatedAt")) or 0
+        local ay = ry and tonumber(ry:GetAttribute("CreatedAt")) or 0
+        return ax < ay
+    end)
+    return out
+end
+
+--  หมุนบัฟของ "ชนิดเดียว" ที่ผู้ใช้เลือกไว้เท่านั้น
+--
+--  เดิมผมให้มันหมุนทุกชนิดที่มีสกิลในมาโคร ซึ่งผิด — สกิลของบางทาวเวอร์
+--  ไม่ใช่บัฟ เช่น Drop The Beat ของ DJ Booth เป็นคลื่นดาเมจ
+--  วนกดรัวไปเรื่อยๆ นอกจากไม่ได้ประโยชน์ยังทิ้งคูลดาวน์ทุกครั้งที่บอสยังไม่มา
+--
+--  และบัฟที่ให้สถานะเดียวกันจะไม่ทับกัน ตัวที่กดก่อนชนะเสมอ
+--  ในเกมไม่มีข้อมูลบอกว่าบัฟไหนเป็นสถานะเดียวกัน จึงเดาไม่ได้
+--  ให้ผู้ใช้เลือกชนิดเดียวชัดๆ ปลอดภัยกว่าให้สคริปต์เดาแล้วกดชนกันเอง
+--  สกิลไหนของชนิดนี้เป็น "บัฟ" จริง — เรียนรู้จากการลองจริง
+--
+--  Commander มีสองสกิล แต่มีตัวเดียวที่ทำให้ @Ammo ขึ้น
+--  อีกตัว (Support Caravan) เรียกรถถังและเสียเงิน 2000 ทุกครั้ง
+--  ทดสอบครั้งเดียวแล้วจำไว้ ไม่ต้องให้ผู้ใช้มาบอกและไม่ฝังชื่อไว้ในโค้ด
+--  ต้องมีหลักฐานหลายครั้งก่อนตัดสิน ไม่ใช่ครั้งเดียวจบ
+--
+--  รอบที่แล้ว "Call Of Arms" (ซึ่งเป็นบัฟตัวจริงของ Commander) ถูกตัดออกทันที
+--  ตั้งแต่ครั้งแรกที่ยิงไม่ขึ้น แล้วระบบหมุนบัฟก็ตายไปทั้งเกมเพราะไม่เหลือสกิลให้กด
+--  สาเหตุที่ยิงไม่ขึ้นไม่ใช่ว่ามันไม่ใช่บัฟ แต่เป็นเพราะมีลูปซ้อนกันสองตัวยิงพร้อมกัน
+--  บัฟสถานะเดียวกันทับกันไม่ได้ ตัวที่ยิงทีหลังจึงไม่เกิดผล แล้วถูกตีความว่า "ไม่ใช่บัฟ"
+--
+--  การตัดสินผิดครั้งเดียวมีราคาสูงมาก (เสียบัฟทั้งเกม) ส่วนการลองเกินไปสองสามครั้ง
+--  แทบไม่เสียอะไรเลย เกณฑ์จึงต้องเอียงไปทาง "ให้โอกาส"
+local notBuff  = {}      -- ชื่อสกิล → true เมื่อพิสูจน์แล้วว่าไม่ใช่บัฟ
+local buffMiss = {}      -- ชื่อสกิล → ยิงแล้วไม่ขึ้นมากี่ครั้ง
+local BUFF_STRIKES = 3
+
+--  กันลูปหมุนบัฟซ้อนกัน
+--
+--  ปิดแล้วเปิดใหม่เร็วๆ ทำให้ลูปเก่ายังไม่ทันเห็นว่า autoBuff เป็น false
+--  (มันติดอยู่ในช่วงรอบัฟหมด ซึ่งรอได้ถึง 90 วินาที) พอเปิดใหม่ก็มีลูปที่สอง
+--  แล้วสองตัวจะยิงชนกันเอง — ซึ่งเป็นต้นเหตุที่ Call Of Arms ถูกตัดออก
+--  เลขรุ่นทำให้ลูปเก่ารู้ตัวและออกทันทีในรอบถัดไป ไม่ว่าจะค้างอยู่ตรงไหน
+local buffGen = 0
+
+--  รวมรายชื่อสกิลที่จะลอง: เอาจากโมดูลเกมก่อน ไม่มีค่อยใช้ของที่อัดไว้
+local function buffCandidates(kind)
+    local out, seen = {}, {}
+    for _, ab in ipairs(freeAbilities(kind)) do
+        if not seen[ab.name] then
+            seen[ab.name] = true
+            table.insert(out, ab)
+        end
+    end
+    for _, n in ipairs(abilityNamesOf(kind)) do
+        if not seen[n] then
+            seen[n] = true
+            table.insert(out, { name = n, level = 0 })
+        end
+    end
+    return out
+end
+
+--  เลือกชนิดที่จะหมุนจากสภาพสนาม "ตอนนี้"
+--
+--  ต้องเลือกใหม่ทุกรอบ ไม่ใช่เลือกครั้งเดียวตอนกดสวิตช์
+--
+--  อาการที่เจอ: เปิดสวิตช์ค้างไว้ก่อนแล้วค่อยวาง Commander → ระบบไม่หมุนให้เลย
+--  ต้องปิดแล้วเปิดใหม่ถึงจะทำงาน สาเหตุคือตอนกดเปิด สนามยังไม่มี Commander
+--  มันเลยถอยไปหยิบชนิดจากมาโครที่โหลดไว้ ซึ่งได้ DJ Booth มา (มาโครมีสกิล DJ อยู่)
+--  แล้วค่านั้นค้างอยู่ตลอด ต่อให้วาง Commander ทีหลังก็ไม่มีใครไปแก้ให้
+--
+--  เลือกใหม่ทุกรอบแก้ได้หมดและไม่มีทางสลับไปมา เพราะกติกาตายตัว:
+--  ของในสนามมาก่อนของในมาโคร และ Commander มาก่อนชนิดอื่นเสมอ
+local function resolveBuffKind()
+    --  มาโครจดไว้ว่าจะหมุนของชนิดไหน ให้ยึดตามนั้นเสมอ ห้ามเปลี่ยนใจเอง
+    --
+    --  log จริงรอบที่แล้ว: เวฟ 10 วาง DJ Booth ลงไปตอนที่ยังไม่มี Commander สักตัว
+    --  ตัวเลือกอัตโนมัติเลยสลับไปหมุน DJ Booth แล้วรัวกด Drop The Beat สามครั้ง
+    --  ซึ่งเป็นคลื่นดาเมจ ไม่ใช่บัฟ — ทิ้งคูลดาวน์ฟรีสามรอบตอนที่บอสยังไม่มา
+    --  แล้วยังไปตัดชื่อสกิลนั้นทิ้งอีก ทั้งที่มันไม่เคยควรถูกหมุนตั้งแต่แรก
+    --
+    --  ผู้ใช้เลือกไว้แล้วตอนอัดว่าจะหมุน Commander การไปเดาใหม่ระหว่างเล่นมีแต่เสีย
+    local want = macro and macro.autoBuff and macro.autoBuff.kind
+    if type(want) == "string" and want ~= "" then return want end
+
+    local pick = ""
+    local f = towersFolder()
+    local seen = {}
+    if f then
+        for _, m in ipairs(f:GetChildren()) do
+            local k = isMine(m) and tName(m)
+            if k and not seen[k] then
+                seen[k] = true
+                if #freeAbilities(k) > 0 then
+                    if k == "Commander" then return k end
+                    if pick == "" then pick = k end
+                end
+            end
+        end
+    end
+    if pick ~= "" then return pick end
+
+    --  ไม่เจอในสนาม ลองจากมาโครที่โหลดไว้
+    for _, kind in ipairs(kindsWithAbility()) do
+        if kind == "Commander" then return kind end
+        if pick == "" then pick = kind end
+    end
+    return pick
+end
+
+local function autoBuffLoop()
+    buffGen = buffGen + 1
+    local myGen = buffGen
+
+    task.spawn(function()
+        while autoBuff and buffGen == myGen do
+            --  เลือกชนิดใหม่ทุกรอบ เผื่อ Commander เพิ่งถูกวางลงสนาม
+            local fresh = resolveBuffKind()
+            if fresh ~= "" and fresh ~= buffKind then
+                dlog("หมุนบัฟ: เปลี่ยนชนิดจาก %q เป็น %q (ดูจากทาวเวอร์ในสนามตอนนี้)",
+                    buffKind, fresh)
+                buffKind = fresh
+                status = T("AUTOBUFF_ON", buffKind)
+            end
+
+            local kind = buffKind
+            local list = (kind ~= "") and towersOfType(kind) or {}
+
+            --  เลือกสกิลที่ยังไม่ถูกตัดออกว่าไม่ใช่บัฟ
+            local ability, needLevel
+            for _, ab in ipairs(buffCandidates(kind)) do
+                if not notBuff[ab.name] then
+                    ability, needLevel = ab.name, ab.level
+                    break
+                end
+            end
+
+            if #list == 0 or not ability then
+                task.wait(2)
+            else
+                for _, m in ipairs(list) do
+                    if not autoBuff or buffGen ~= myGen then break end
+
+                    --  ยังอัปเกรดไม่ถึงระดับที่สกิลต้องการ กดไปก็ไม่มีอะไรเกิด
+                    --  ข้ามไปเลย ไม่ต้องเสียเวลารอ 5 วินาทีเพื่อพบว่าบัฟไม่ขึ้น
+                    if needLevel and needLevel > 0 and tLevel(m) < needLevel then
+                        m = nil
+                    end
+
+                    if m and m.Parent then
+                        --  1. รอให้บัฟของชนิดนี้หมดทุกตัวก่อน เกมนี้บัฟทับกันไม่ได้
+                        --     กดซ้อนตอนตัวก่อนยังทำงาน ตัวที่กดทีหลังเสียเปล่า
+                        local until_ = os.clock() + 90
+                        while autoBuff and buffGen == myGen and anyBuffRunning(kind)
+                            and os.clock() < until_ do
+                            task.wait(0.2)
+                        end
+                        if not autoBuff or buffGen ~= myGen then break end
+
+                        --  ยังมีบัฟค้างอยู่ทั้งที่รอจนหมดเวลา = ยิงตอนนี้เสียเปล่าแน่นอน
+                        --  และถ้ายิงไป ผลที่ไม่ขึ้นจะถูกนับเป็นหลักฐานว่า "ไม่ใช่บัฟ" ทั้งที่ไม่ใช่
+                        local blocked = anyBuffRunning(kind)
+
+                        pcall(cmdAbility, m, ability, {})
+
+                        --  2. รอให้บัฟ "ขึ้นจริง" ก่อนไปตัวถัดไป
+                        --
+                        --     จุดนี้คือที่พลาดมาตลอด: จากการจับเวลาจริง ค่า @Ammo
+                        --     ใช้เวลา ~2 วินาทีกว่าจะเดินทางมาถึงฝั่งเรา
+                        --     ถ้าเช็คเร็วกว่านั้นจะเห็น 0 แล้วเข้าใจว่าบัฟจบแล้ว
+                        --     ทั้งที่ยังไม่เริ่มด้วยซ้ำ จึงยิงตัวถัดไปทันทีแล้วบัฟทับกัน
+                        local wait5 = os.clock() + 5
+                        while autoBuff and not buffRunning(m)
+                            and os.clock() < wait5 do
+                            task.wait(0.1)
+                        end
+
+                        --  3. ยิงแล้วบัฟไม่ขึ้น — อาจไม่ใช่สกิลบัฟ แต่ยังไม่ฟันธง
+                        --
+                        --     เหตุที่บัฟไม่ขึ้นมีได้หลายอย่างที่ไม่เกี่ยวกับตัวสกิลเลย
+                        --     เช่นมีบัฟตัวอื่นค้างอยู่ หรือคูลดาวน์ยังไม่หมด
+                        --     ต้องพลาดติดกันครบโควตาถึงจะตัดออก และไม่นับครั้งที่มีบัฟค้าง
+                        if autoBuff and buffGen == myGen and not buffRunning(m) then
+                            if not blocked then
+                                buffMiss[ability] = (buffMiss[ability] or 0) + 1
+                                dlog("หมุนบัฟ: ยิง %q แล้วบัฟไม่ขึ้น (%d/%d)",
+                                    ability, buffMiss[ability], BUFF_STRIKES)
+
+                                if buffMiss[ability] >= BUFF_STRIKES then
+                                    notBuff[ability] = true
+                                    dlog("สกิล %q ไม่ทำให้บัฟขึ้นครบ %d ครั้ง — ตัดออก",
+                                        ability, BUFF_STRIKES)
+                                    break
+                                end
+                            else
+                                dlog("หมุนบัฟ: ยิง %q ตอนยังมีบัฟค้าง ไม่นับเป็นความผิดของสกิล",
+                                    ability)
+                            end
+                        else
+                            --  ขึ้นแล้ว = สกิลนี้ใช้ได้จริง ล้างประวัติพลาดทิ้ง
+                            --  ไม่งั้นความพลาดที่กระจายอยู่คนละช่วงเกมจะสะสมจนตัดออกเอง
+                            buffMiss[ability] = nil
+                        end
+                    end
+                end
+                task.wait(0.3)
+            end
+        end
+    end)
+end
+
+local function playOnce()
+    if not macro or #macro.actions == 0 then
+        status = T("EMPTY_MACRO")
+        return
+    end
+
+    refModel, modelRef, deadRef, refPos = {}, {}, {}, {}
+
+    --  จดตำแหน่งของทุกคำสั่งวางไว้ก่อน เพื่อให้คำสั่งที่อ้างถึง ref นั้น
+    --  ตามหาทาวเวอร์เองได้ทีหลัง แม้ตอนวางจะรายงานว่าพลาด
+    for _, act in ipairs(macro.actions) do
+        if act.type == "place" and act.ref and act.pos then
+            refPos[act.ref] = {
+                pos  = Vector3.new(act.pos[1], act.pos[2], act.pos[3]),
+                name = act.tower,
+            }
+        end
+    end
+
+    --  แยกสกิลออกจากคิวหลัก แล้วปล่อยให้วิ่งขนานกันไป
+    --  มาโครนี้อัดตอนเปิดหมุนบัฟไว้ → เปิดให้เองด้วยชนิดเดิม
+    --  ผู้ใช้ไม่ต้องจำว่าตอนอัดเปิดอะไรไว้บ้าง
+    --  บอกให้ชัดว่าไฟล์มาโครจดหมุนบัฟไว้จริงไหม
+    --  ไม่งั้นแยกไม่ออกระหว่าง "ไฟล์ไม่ได้จด" กับ "จดแล้วแต่ผู้ใช้เปิดสวิตช์ไว้เองอยู่แล้ว"
+    --  สองกรณีนี้ log หน้าตาเหมือนกันเป๊ะ แต่ต้องแก้คนละที่
+    dlog("มาโครนี้จดหมุนบัฟไว้: %s | สวิตช์ตอนนี้: %s",
+        (macro.autoBuff and macro.autoBuff.kind) or "ไม่ได้จด",
+        autoBuff and ("เปิดอยู่ (" .. buffKind .. ")") or "ปิดอยู่")
+
+    if macro.autoBuff and macro.autoBuff.kind then
+        buffKind = macro.autoBuff.kind
+        if not autoBuff then
+            autoBuff = true
+            autoBuffLoop()
+            dlog("เปิดหมุนบัฟ %s ให้อัตโนมัติ (มาโครนี้อัดตอนเปิดไว้)", buffKind)
+
+            --  ติ๊กช่องใน UI ตามด้วย ไม่งั้นผู้ใช้เห็นช่องว่างทั้งที่มันกำลังหมุนอยู่
+            --  แล้วจะกดปิดไม่ได้ เพราะกดครั้งแรกคือ "เปิด" ในสายตาของสวิตช์
+            task.defer(function()
+                pcall(function() AutoBuffToggle:Set(true) end)
+            end)
+        end
+    end
+
+    local mainList, abilityList, skipList = {}, {}, {}
+
+    --  ชนิดที่ระบบหมุนบัฟดูแลอยู่ มาโครต้องไม่ไปกดซ้ำ ไม่งั้นจะแย่งกันเอง
+    --  แล้วบัฟจะชนกันจนได้ผลแค่ตัวที่กดก่อน ซึ่งแย่กว่าไม่กดเลย
+    local placeName = {}
+    for _, a in ipairs(macro.actions) do
+        if a.type == "place" and a.ref then placeName[a.ref] = a.tower end
+    end
+
+    for _, act in ipairs(macro.actions) do
+        local handledByAuto = autoBuff and act.type == "ability"
+            and placeName[act.ref] == buffKind
+
+        if handledByAuto then
+            --  ปล่อยให้ระบบหมุนบัฟจัดการ
+        elseif act.type == "ability" and abilityTiming then
+            table.insert(abilityList, act)
+        elseif act.type == "skip" then
+            --  การโหวตไม่ใช่เงื่อนไขของคำสั่งไหน ปล่อยให้วิ่งขนานไป
+            --  จะได้ไม่ลากคิวหลักหยุดตามตอนเซิร์ฟเวอร์ยังไม่เปิดรับโหวต
+            table.insert(skipList, act)
+        else
+            table.insert(mainList, act)
+        end
+    end
+
+    --  FocusFarm — ขายฟาร์มที่เวฟสุดท้ายต้องรอเวฟนั้นจริงๆ
+    --
+    --  ปิด "รอถึงเวฟ" คือบอกว่า "มีเงินแล้วทำเลย" ซึ่งดีกับการวางและอัปเกรด
+    --  แต่กับการขายฟาร์มทิ้งท้ายเกมมันตรงกันข้าม — ขายเร็วไปหนึ่งเวฟ
+    --  เท่ากับทิ้งรายได้ทั้งเวฟนั้นไปฟรีๆ ในเวฟที่ฟาร์มทำเงินได้มากที่สุด
+    --  (log จริง: อัดไว้ขายเวฟ 20 แต่ขายจริงตอนเวฟ 19 ทั้ง 10 ตัว)
+    --
+    --  เฉพาะฟาร์มและเฉพาะเวฟสุดท้ายเท่านั้น การขายอย่างอื่นหรือขายกลางเกม
+    --  มักเป็นการขายเพื่อเอาเงินไปทำอย่างอื่นต่อ ซึ่งยิ่งเร็วยิ่งดี ไม่ควรไปหน่วง
+    local focusSell = {}
+    do
+        local macroLast = 0
+        for _, act in ipairs(macro.actions) do
+            if (act.wave or 0) > macroLast then macroLast = act.wave end
+        end
+        local last = getWaveMax() or macroLast
+
+        if last and last > 0 then
+            for _, act in ipairs(macro.actions) do
+                if act.type == "sell" and (act.wave or 0) >= last
+                    and placeName[act.ref] == "Farm" then
+                    focusSell[act] = true
+                end
+            end
+        end
+
+        local n = 0
+        for _ in pairs(focusSell) do n = n + 1 end
+        if n > 0 then
+            dlog("FocusFarm: ขายฟาร์ม %d ตัวที่เวฟ %s จะรอให้ถึงเวฟนั้นก่อนเสมอ",
+                n, tostring(last))
+        end
+    end
+
+    local playStart = os.clock()
+    waveStart = {}
+    logStart, logLines, failLog = os.clock(), {}, {}
+    costFixed, paidOf = 0, {}
+    lastWalkTower = nil      -- รอบใหม่ เดินไปที่แรกอีกครั้ง
+    dlog("=== เริ่มเล่น %s · %d คำสั่ง · แมพ %s · เวฟตอนนี้ %d (raw=%s) ===",
+        tostring(macro.name), #macro.actions, tostring(macro.map),
+        getWave(), tostring(lastWaveText))
+    --  เล่นต่อจากที่ค้างไว้ไหม
+    --
+    --  เงื่อนไขต้องครบทุกข้อ: มาโครตัวเดิม จำนวนคำสั่งเท่าเดิม ด่านเดิม
+    --  และเวฟต้องไม่ถอยหลัง (ถอยหลัง = ขึ้นแมตช์ใหม่แล้ว ต้องเริ่มหนึ่งใหม่)
+    --  ขาดข้อเดียวก็เริ่มใหม่ ปลอดภัยกว่าเล่นต่อผิดที่
+    local startFrom = 1
+    if resume and resume.name == macro.name
+        and resume.count == #mainList
+        and resume.map == getMapName()
+        and getWave() >= (resume.wave or 0)
+        and resume.index > 1 then
+
+        startFrom = resume.index
+        dlog("เล่นต่อจากคำสั่งที่ %d/%d (หยุดไว้ตอนเวฟ %d)",
+            startFrom, #mainList, resume.wave or 0)
+
+        --  สกิลกับโหวตของเวฟที่ผ่านไปแล้วต้องตัดทิ้ง
+        --  ไม่งั้นมันจะยิงสกิลของเวฟเก่ารัวทันทีที่เริ่ม เปลืองคูลดาวน์เปล่า
+        local w = getWave()
+        for _, list in ipairs({ abilityList, skipList }) do
+            for i = #list, 1, -1 do
+                if (list[i].wave or 0) < w then table.remove(list, i) end
+            end
+        end
+    end
+    resume = nil
+
+    local total = #mainList
+    local fails = 0
+
+    watchWavesWhilePlaying()
+    if #abilityList > 0 then
+        dlog("แยกสกิล %d คำสั่งไปวิ่งตามจังหวะของตัวเอง", #abilityList)
+        task.spawn(function() pcall(runAbilityTrack, abilityList) end)
+    end
+    if #skipList > 0 then
+        dlog("แยกโหวตข้ามเวฟ %d คำสั่งไปวิ่งขนาน คิวหลักจะไม่หยุดรอโหวต", #skipList)
+        task.spawn(function() pcall(runSkipTrack, skipList) end)
+    end
+
+    for i = startFrom, #mainList do
+        local a = mainList[i]
+
+        --  ถูกสั่งหยุดกลางคัน — จดไว้ว่าค้างที่ไหน แล้วค่อยเล่นต่อรอบหน้า
+        if not playing then
+            resume = {
+                name  = macro.name,
+                index = i,
+                count = #mainList,
+                map   = getMapName(),
+                wave  = getWave(),
+            }
+            dlog("หยุดที่คำสั่งที่ %d/%d — เปิดใหม่จะเล่นต่อจากตรงนี้", i, #mainList)
+            break
+        end
+
+        if debugLog then
+            local info = (a.type == "place") and slotInfo(a.slot) or nil
+            dlog("#%d %s ref=%s อัดไว้ที่เวฟ %s | ตอนนี้เวฟ %d (raw=%s) เงิน %s ราคาที่อัด %s%s",
+                i, a.type, tostring(a.ref), tostring(a.wave),
+                getWave(), tostring(lastWaveText), tostring(getCash()), tostring(a.cost),
+                info and (" | ช่อง " .. tostring(a.slot)
+                          .. " ราคาสด " .. tostring(info.cost)
+                          .. " คูลดาวน์ " .. tostring(info.cooldown)) or "")
+        end
+
+        -- รอให้ถึงเวฟที่อัดไว้
+        --  FocusFarm บังคับรอเสมอ แม้ผู้ใช้จะปิด "รอถึงเวฟ" ไว้
+        if (waveGate or focusSell[a]) and a.wave and a.wave > 0 then
+            if focusSell[a] and not waveGate and getWave() < a.wave then
+                dlog("   FocusFarm: รอถึงเวฟ %d ก่อนขายฟาร์ม (ตอนนี้เวฟ %d)",
+                    a.wave, getWave())
+            end
+            while playing and getWave() < a.wave do
+                status = T("WAIT_WAVE", i, total, a.wave, getWave())
+                task.wait(0.3)
+            end
+        end
+        --  เล่นตามเวลาที่อัด — รอให้ถึงวินาทีเดียวกับตอนอัดก่อนค่อยทำ
+        --  เหมาะกับสูตรที่ต้องกดให้ทันจังหวะ
+        --
+        --  ปิดไว้จะทำทันทีที่เงินพอ ซึ่งทนกว่าในกรณีทั่วไป เพราะรอบนี้เงินอาจ
+        --  เข้าช้าหรือเร็วกว่าตอนอัด การยึดนาฬิกาจะกลายเป็นรอเก้อหรือยิงก่อนเงินมา
+        if timedPlay and a.t then
+            while playing do
+                local left = a.t - (os.clock() - playStart)
+                if left <= 0 then break end
+                status = T("WAIT_TIME", i, total, left)
+                task.wait(math.min(left, 0.3))
+            end
+        end
+        if not playing then break end
+
+        local actionAt = os.clock()
+        local ok, wasDead = runAction(a, i, total)
+        local spent = os.clock() - actionAt
+        if debugLog then
+            dlog("   => %s  (%.1f วิ)  ทาวเวอร์ในสนาม %d",
+                ok and "สำเร็จ" or (wasDead and "ข้าม-ทาวเวอร์ไม่มี" or "ข้าม-หมดเวลา"),
+                os.clock() - actionAt, myTowerCount())
+        end
+        if not ok then
+            --  จดไว้สรุปท้ายไฟล์ จะได้ไม่ต้องไล่อ่านทั้ง 800 บรรทัด
+            table.insert(failLog, ("#%d %s%s\n      เซิร์ฟเวอร์ตอบ: %s\n      ตอนนั้น: เวฟ %d · เงิน %s · ทาวเวอร์ %s")
+                :format(
+                    i, actionLabel(a),
+                    a.type == "place"
+                        and (" " .. tostring(a.tower) ..
+                             (" ที่ (%.2f, %.2f, %.2f)"):format(a.pos[1], a.pos[2], a.pos[3]))
+                        or "",
+                    a.type == "place" and (lastReply ~= "" and lastReply or "-")
+                        or (wasDead and "ไม่มีทาวเวอร์ให้ทำ" or "หมดเวลาลองซ้ำ"),
+                    getWave(),
+                    getCash() and ("$" .. getCash()) or "อ่านไม่ได้",
+                    towerBreakdown()))
+            lastReply = ""
+
+            fails = fails + 1
+            lastError = wasDead
+                and T("SKIPPED_DEP", i, actionLabel(a))
+                --  บอกเวลาที่ใช้ไปจริง ไม่ใช่ค่าที่ตั้งไว้
+                --  เดิมพิมพ์ 45 วินาทีเสมอ ทั้งที่บางครั้งยอมแพ้ตั้งแต่ 8 วินาที
+                --  ทำให้เข้าใจผิดว่าติดอยู่นานกว่าความจริง
+                or  T("SKIPPED", i, actionLabel(a), math.floor(spent + 0.5))
+        end
+
+        --  วางไม่ขึ้น = ทาวเวอร์ตัวนี้ไม่มีในสนาม
+        --  จดไว้เพื่อให้คำสั่งที่อ้างถึงมันข้ามได้ทันที ไม่ต้องรอหมดเวลาทีละอัน
+        if not ok and a.type == "place" then
+            deadRef[a.ref] = true
+
+            --  บอกด้วยว่าตอนนั้นในสนามมีทาวเวอร์กี่ตัว ช่วยแยกสองสาเหตุออกจากกัน
+            --  จำนวนเพิ่ม = วางขึ้นจริงแต่เราจับคู่ไม่ได้
+            --  จำนวนเท่าเดิม = เซิร์ฟเวอร์ปฏิเสธจริง (จุดนั้นมีของ หรือชนลิมิต)
+            lastError = lastError .. T("PLACE_INFO", myTowerCount())
+        end
+
+        task.wait(cmdDelay)
+    end
+
+    --  ตัดคำสั่งที่พิสูจน์แล้วว่าเป็นไปไม่ได้ออกจากมาโครถาวร
+    --
+    --  มาโครที่อัดไว้ก่อนมีตัวตรวจตอนอัด ยังมีคำสั่งที่ผู้เล่นกดพลาดติดอยู่
+    --  ปล่อยไว้ก็เสียเวลาทุกรอบที่เล่น เก็บกวาดให้เองดีกว่าให้ไปอัดใหม่ทั้งชุด
+    local cleaned = 0
+    for i = #macro.actions, 1, -1 do
+        if macro.actions[i].impossible then
+            table.remove(macro.actions, i)
+            cleaned = cleaned + 1
+        end
+    end
+
+    --  บันทึกราคาที่เรียนรู้ได้ลงไฟล์ ไม่งั้นความรู้นี้หายไปทุกรอบ
+    --
+    --  เดิมโค้ดแก้ a.cost ให้ถูกอยู่แล้วตอนเล่น แต่แก้แค่ในหน่วยความจำ
+    --  พอเล่นรอบใหม่ก็โหลดเลขเก่าจากไฟล์กลับมา แล้วนั่งรอเงินซ้ำที่เดิมทุกครั้ง
+    --  เท่ากับเรียนรู้แล้วลืมทันที
+    if cleaned > 0 or costFixed > 0 then
+        writeMacro(macro)
+        if cleaned > 0 then
+            dlog("ตัดคำสั่งที่เป็นไปไม่ได้ออก %d รายการ", cleaned)
+        end
+        if costFixed > 0 then
+            dlog("แก้ราคาที่จดไว้ให้ตรงความจริง %d รายการ — รอบหน้าจะไม่ต้องรอเงินเก้าอีก",
+                costFixed)
+        end
+        dlog("บันทึกทับไฟล์มาโครแล้ว")
+    end
+
+    dlog("")
+    dlog("═══════════════════════════════════════════════")
+    dlog("  สรุป: ทำสำเร็จ %d จาก %d คำสั่ง", total - fails, total)
+    dlog("═══════════════════════════════════════════════")
+
+    if #failLog == 0 then
+        dlog("  ไม่มีคำสั่งไหนพลาดเลย")
+    else
+        dlog("  คำสั่งที่ไม่สำเร็จ %d รายการ:", #failLog)
+        for _, line in ipairs(failLog) do
+            dlog("")
+            dlog("  " .. line)
+        end
+    end
+    saveLog()
+
+    if playing then
+        --  เล่นจนจบรายการแล้ว ไม่มีอะไรให้เล่นต่อ
+        resume = nil
+        status = fails == 0 and T("DONE_ALL", total) or T("DONE_SKIP", fails)
+    end
+end
+
+local function startPlaying()
+    if recording then status = T("REC_STOP") return false end
+
+    --  อยู่ในห้องเลือกด่านก็เปิดสวิตช์ค้างไว้ได้
+    --
+    --  เดิมปฏิเสธทันทีถ้ายังไม่อยู่ในแมพ ซึ่งทำให้ AFK ข้ามรอบไม่ได้เลย
+    --  พอจบเกมแล้วเด้งกลับห้องเลือกด่าน สวิตช์จะถูกปิดแล้วไม่มีใครเปิดให้อีก
+    --  ตอนนี้ถ้าอยู่ในห้องเลือกด่านจะรอเงียบๆ ไม่เล่นอะไร รอจนโหลดแมพจริงเสร็จ
+    if not inGame() and not inLobby() then
+        status = T("NOT_IN_GAME")
+        return false
+    end
+    if not macro or #macro.actions == 0 then
+        status = T("NEED_CMDS")
+        return false
+    end
+
+    local ok, msg = checkLoadout()
+    loadoutMsg = msg
+    if not ok then
+        pcall(function()
+            WindUI:Notify({ Title = "Loadout Mismatch", Content = msg, Duration = 8, Icon = "triangle-alert" })
+        end)
+    end
+
+    playing = true
+    lastError = ""
+
+    --  เปิดค้างไว้ = เล่นซ้ำเมื่อขึ้นแมตช์ใหม่
+    --  เช็คจากเวฟที่ถอยกลับไปต้นเกม ไม่ใช่วนทันที เพราะการวนทันทีจะไปวาง
+    --  ทับทาวเวอร์ที่ยังอยู่ในสนาม แล้วล้มเหลวรัวทั้งชุด
+    task.spawn(function()
+        while playing do
+            --  ยังไม่พร้อมเล่น — รอเฉยๆ ไม่ยิงคำสั่งอะไรทั้งนั้น
+            --
+            --  สองเงื่อนไข:
+            --    1. ยังไม่อยู่ในแมพจริง (อยู่ห้องเลือกด่าน หรือแมพกำลังโหลด)
+            --    2. อยู่ในแมพแล้วแต่ "คนละด่านกับที่อัดไว้"
+            --
+            --  ข้อ 2 สำคัญพอๆ กับข้อ 1 มาโครผูกกับทางเดินและจุดวางของด่านนั้นโดยตรง
+            --  เอาไปเล่นด่านอื่นคือวางทาวเวอร์ลงจุดที่ไม่มีอยู่จริง เสียเงินและเสียรอบเปล่า
+            --  ของเดิมเล่นทุกที่ที่เข้าไป ซึ่งพังเงียบๆ แบบที่ดูไม่ออกว่าทำไม
+            while playing do
+                local mapNow  = getMapName()
+                local mapWant = macro and macro.map
+                local known   = type(mapWant) == "string"
+                    and mapWant ~= "" and mapWant ~= "?"
+
+                --  อยู่ห้องเลือกด่าน = ยังไม่ได้เริ่มเล่นแน่นอน ไม่ว่าค่าอื่นจะอ่านได้ว่าอะไร
+                --  เช็คตัวนี้ด้วยเพราะบางที State กับ Towers ยังค้างจากเกมก่อนหน้า
+                --  แล้ว inGame() จะตอบว่าจริงทั้งที่ยังยืนอยู่หน้า Vote For A Map
+                if not inGame() or inLobby() then
+                    status = T("READY_WAIT")
+
+                elseif known and mapNow == "?" then
+                    --  ยังอ่านชื่อด่านไม่ได้ = ยังไม่รู้ว่าถูกด่านไหม
+                    --  รอไว้ก่อนปลอดภัยกว่าเดาว่าถูกแล้วลงมือ
+                    status = T("READY_WAIT")
+
+                elseif known and mapNow:lower() ~= mapWant:lower() then
+                    status = T("WAIT_MAP", mapWant, mapNow)
+
+                else
+                    break
+                end
+                task.wait(1)
+            end
+            if not playing then break end
+
+            --  แมพเพิ่งโหลดเสร็จ ให้เกมตั้งตัวก่อนสักครู่
+            --  ยิงคำสั่งแรกตอน Towers เพิ่งถูกสร้างมักได้ผลว่า "วางไม่ขึ้น"
+            task.wait(2)
+            if not playing then break end
+
+            --  ต้องคร่อม pcall ไว้ ไม่งั้นข้อผิดพลาดใดๆ ในระหว่างเล่นจะฆ่าเธรดนี้
+            --  ทิ้งไปเงียบๆ สวิตช์ยังค้างเป็นเปิด สถานะยังเป็นข้อความเดิม
+            --  ผู้ใช้จะเห็นแค่ "มาโครหยุดทำอะไรเฉยๆ" โดยไม่มีอะไรบอกสาเหตุ
+            --  (เกิดมาแล้วจริงจากการเรียกฟังก์ชันที่ถูกลบทิ้งไป)
+            local fine, err = pcall(playOnce)
+            if not fine then
+                lastError = T("CRASH", tostring(err))
+                status    = T("CRASH_STOP")
+                playing   = false
+                break
+            end
+            if not playing then break end
+
+            status = status .. T("WAIT_MATCH")
+            local lastWave = getWave()
+            while playing do
+                local w = getWave()
+                if w < lastWave or (w <= 1 and lastWave > 1) then break end
+                lastWave = math.max(lastWave, w)
+                task.wait(1)
+            end
+            if playing then task.wait(3) end
+        end
+    end)
+    return true
+end
+
+local function stopPlaying()
+    playing = false
+    status = T("STOPPED")
+end
+
+-- ═══════════════════════════════════════════════════
+--  โหวตแมพเองใน IntermissionLobby
+--
+--  ลำดับที่ต้องทำ (ตามที่ผู้ใช้อธิบายจากการเล่นจริง)
+--    1. เดินไป IntermissionLobby.MapVote.ProximityPrompt แล้วสั่งกด → เปิดหน้าต่างเลือกแมพ
+--    2. เลือกแมพที่ตั้งไว้ในช่อง Select Map
+--    3. แมพที่เลือกจะไปโผล่บนกระดานใดกระดานหนึ่งใน Boards.Board1..4
+--    4. เดินไปกระดานนั้น กด ProximityPrompt บน Hitboxes.VotePlatform เพื่อโหวต
+--    5. กด Ready แล้วรอโหลดแมพ
+--
+--  ข้อ 1 กับ 4 ทำได้เลยเพราะรู้ที่อยู่แน่นอนแล้ว
+--  ข้อ 2 กับ 5 ยังไม่รู้ว่าเกมส่งอะไรไปหาเซิร์ฟเวอร์ ต้องดักของจริงก่อน
+--  จึงยังไม่เขียนส่วนนั้น — เดาแล้วพลาดเคยทำให้ทั้งสคริปต์ใช้ไม่ได้มาแล้ว
+-- ═══════════════════════════════════════════════════
+local firePrompt = rawget(getfenv(), "fireproximityprompt")
+
+--  กระดานไหนกำลังแสดงแมพชื่อนี้อยู่
+--
+--  ชื่อแมพอยู่ที่  Board<N>.Hitboxes.Bottom.MapDisplay.Title  (ยืนยันจากการดักจริง)
+--  จำนวนโหวตอยู่ที่ Board<N>.Hitboxes.Count.Counter.Value    ใช้ตรวจว่าโหวตติดจริงไหม
+--  อ่านตรงจุดแบบนี้เร็วกว่าและแม่นกว่ากวาดหาข้อความทั้งกระดาน
+--  (ของเดิมกวาดแล้วจะไปเจอ "Created by ..." หรือชื่อคนโหวตด้วย)
+local function boardMapTitle(b)
+    local hb = b and b:FindFirstChild("Hitboxes")
+    local bt = hb and hb:FindFirstChild("Bottom")
+    local md = bt and bt:FindFirstChild("MapDisplay")
+    local ti = md and md:FindFirstChild("Title")
+    return (ti and ti:IsA("TextLabel")) and ti.Text or nil
+end
+
+local function boardVoteCount(b)
+    local hb = b and b:FindFirstChild("Hitboxes")
+    local ct = hb and hb:FindFirstChild("Count")
+    local cn = ct and ct:FindFirstChild("Counter")
+    local va = cn and cn:FindFirstChild("Value")
+    return (va and va:IsA("TextLabel")) and (tonumber(va.Text) or 0) or nil
+end
+
+local function findMapBoard(name)
+    local lb = lobbyFolder()
+    local boards = lb and lb:FindFirstChild("Boards")
+    if not (boards and type(name) == "string" and name ~= "") then return nil end
+
+    for _, b in ipairs(boards:GetChildren()) do
+        if boardMapTitle(b) == name then return b end
+    end
+    return nil
+end
+
+--  แท่นโหวตของกระดานนั้น
+--  ผู้ใช้บอกว่าเป็นลูกตัวที่สอง แต่ค้นหาเอาปลอดภัยกว่านับตำแหน่ง
+--  ลำดับลูกใน Roblox ไม่รับประกันว่าคงที่
+local function boardVotePrompt(board)
+    local hb = board and board:FindFirstChild("Hitboxes")
+    local vp = hb and hb:FindFirstChild("VotePlatform")
+    if not vp then return nil end
+
+    for _, c in ipairs(vp:GetDescendants()) do
+        if c:IsA("ProximityPrompt") then return c, c.Parent end
+    end
+    return nil
+end
+
+-- ── คำสั่งของห้องเลือกด่าน (ดักของจริงมา ไม่ได้เดา) ──
+--
+--    RF ("LobbyVoting", "Override", ชื่อแมพ)                 บังคับให้แมพนี้ขึ้นกระดาน (ต้องมี VIP)
+--    RE ("LobbyVoting", "Vote",     ชื่อแมพ, ตำแหน่งแท่น)     โหวตกระดานนั้น
+--    RE ("LobbyVoting", "Ready")                             กดพร้อมเริ่มเกม
+--
+--  ตัว Vote ส่ง Vector3 ไปด้วย ซึ่งตรงกับตำแหน่งของ Attachment บนแท่นโหวต
+--  จึงต้องหยิบจากกระดานที่ถูกต้อง ส่งตำแหน่งผิดกระดานคือโหวตผิดแมพ
+local function cmdOverrideMap(name)
+    return RF:InvokeServer("LobbyVoting", "Override", name)
+end
+
+local function cmdVoteMap(name, pos)
+    RE:FireServer("LobbyVoting", "Vote", name, pos)
+end
+
+local function cmdLobbyReady()
+    RE:FireServer("LobbyVoting", "Ready")
+end
+
+--  กันลูปซ้อน แบบเดียวกับหมุนบัฟ
+--  กดปิดแล้วเปิดใหม่เร็วๆ ลูปเก่าอาจยังค้างอยู่ในช่วง task.wait
+local voteGen = 0
+
+-- ── ปุ่มบนหน้าสรุปผลตอนจบเกม ────────────────────────────
+--
+--  ดักของจริงมาแล้ว ทั้งสองปุ่มยิง remote คนละตัวและอยู่คนละโฟลเดอร์
+--
+--    Play Again       ReplicatedStorage.Network.GameManager["RE:Rematch"]:FireServer()
+--    Return To Lobby  ReplicatedStorage.Network.Teleport["RE:backToLobby"]:FireServer()
+--
+--  ทั้งคู่ไม่มีอาร์กิวเมนต์เลย
+--
+--  ที่ดักไม่เจอสองรอบก่อนหน้า เพราะไปจ้องแค่ ReplicatedStorage.RemoteEvent
+--  กับ RemoteFunction ซึ่งเป็นทางของคำสั่งในเกม ส่วนสองตัวนี้อยู่ใต้ Network คนละที่กัน
+--
+--  ชื่อ instance มีเครื่องหมาย : อยู่ในชื่อจริงๆ (RE:Rematch) จึงต้องใช้ FindFirstChild
+--  เขียนแบบ Network.GameManager.RE:Rematch ตรงๆ ไม่ได้ Lua จะอ่านเป็นการเรียกเมธอด
+local function netRemote(folder, name)
+    local net = ReplicatedStorage:FindFirstChild("Network")
+    local f   = net and net:FindFirstChild(folder)
+    local r   = f and f:FindFirstChild(name)
+    return (r and r:IsA("RemoteEvent")) and r or nil
+end
+
+local function cmdRematch()
+    local r = netRemote("GameManager", "RE:Rematch")
+    if not r then return false, "ไม่เจอ Network.GameManager.RE:Rematch" end
+    r:FireServer()
+    return true
+end
+
+local function cmdBackToLobby()
+    local r = netRemote("Teleport", "RE:backToLobby")
+    if not r then return false, "ไม่เจอ Network.Teleport.RE:backToLobby" end
+    r:FireServer()
+    return true
+end
+
+--  หน้าสรุปผลขึ้นอยู่ไหม (ใช้เกณฑ์เดียวกับตัวหยุดอัดมาโคร ซึ่งพิสูจน์แล้วว่าแม่น)
+local function gameOverUp()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    local rw  = gui and gui:FindFirstChild("ReactGameNewRewards")
+    local fr  = rw and rw:FindFirstChild("Frame")
+    local go  = fr and fr:FindFirstChild("gameOver")
+    if not go then return false end
+    if go:IsA("GuiObject") and not go.Visible then return false end
+    return true
+end
+
+--  กด Play Again ให้เองเมื่อเกมจบ
+--
+--  ยิงครั้งเดียวต่อการจบเกมหนึ่งครั้ง ล้างธงเมื่อหน้าสรุปผลหายไป
+--  ยิงซ้ำไม่ได้ทำให้ย้ายเร็วขึ้น และการยิง remote รัวๆ ก็ดูผิดปกติ
+--
+--  หมายเหตุ: Rematch พาไป "เซิร์ฟเวอร์ใหม่" ไม่ใช่แค่กลับห้องเลือกด่านของเซิร์ฟเวอร์เดิม
+--  ทุกอย่างจึงต้องถูกจำไว้ในไฟล์ config เพราะสคริปต์จะถูกโหลดใหม่ทั้งหมดที่ปลายทาง
+task.spawn(function()
+    local fired = false
+    while true do
+        task.wait(2)
+
+        if not gameOverUp() then
+            fired = false
+        elseif autoAgain and not fired then
+            fired = true
+            local ok, err = pcall(cmdRematch)
+            vlog(ok and "เกมจบแล้ว — กด Play Again ให้ (ย้ายไปเซิร์ฟเวอร์ใหม่)"
+                    or  ("กด Play Again ไม่สำเร็จ: " .. tostring(err)))
+        end
+    end
+end)
+
+local function autoVoteLoop()
+    voteGen = voteGen + 1
+    local myGen = voteGen
+
+    task.spawn(function()
+        vlog("ลูปเริ่มทำงานแล้ว (แมพที่เลือก: %s)",
+            wantMap ~= "" and wantMap or "ยังไม่ได้เลือก")
+
+        --  ทำไปแล้วในรอบนี้หรือยัง
+        --
+        --  เปิดค้างไว้เพื่อ AFK แปลว่าลูปจะวนอยู่ตลอดเวลา ต้องแยกให้ออกว่า
+        --  "ยังไม่ได้ทำ" กับ "ทำไปแล้วและกำลังอยู่ในด่าน" ไม่งั้นมันจะโหวตซ้ำ
+        --  และกด Ready ซ้ำไปเรื่อยๆ ทั้งที่เข้าด่านเรียบร้อยแล้ว
+        --
+        --  ล้างธงเมื่อกลับมาที่ห้องเลือกด่านรอบใหม่ — จบเกมแล้วมันจะทำให้เองอีกครั้ง
+        --  ไม่ต้องปิดสวิตช์แล้วเปิดใหม่ ซึ่งเป็นสิ่งที่ AFK ทำไม่ได้อยู่แล้ว
+        local votedThisRound = false
+
+        while autoVote and voteGen == myGen do
+            if inGame() then
+                votedThisRound = false
+                vlog("อยู่ในด่านแล้ว — พักไว้ รอบหน้าที่กลับมาห้องเลือกด่านค่อยทำใหม่")
+                task.wait(2)
+
+            elseif not inLobby() then
+                votedThisRound = false
+                vlog("ยังไม่อยู่ในห้องเลือกด่าน (ไม่เจอ workspace.IntermissionLobby)")
+                task.wait(2)
+
+            elseif votedThisRound then
+                --  โหวตและกด Ready ไปแล้วในรอบนี้ รอเข้าด่านอย่างเดียว
+                --  กดซ้ำไม่ได้ทำให้เริ่มเร็วขึ้น เพราะยังต้องรอผู้เล่นคนอื่นอยู่ดี
+                task.wait(2)
+
+            elseif wantMap == "" then
+                status = "Auto Vote: เลือกแมพในช่อง Select Map ก่อน"
+                vlog("ยังไม่ได้เลือกแมพในช่อง Select Map")
+                task.wait(2)
+
+            else
+                local board = findMapBoard(wantMap)
+
+                --  ยังไม่มีแมพนี้บนกระดาน — บังคับด้วย VIP
+                --
+                --  ไม่ต้องเดินไปแท่นแล้วเปิดหน้าต่างเลือกอีกต่อไป
+                --  หน้าต่างนั้นทำอย่างเดียวคือยิงคำสั่งนี้ เรียกตรงๆ จบเร็วกว่าและไม่มีทางพลาดจังหวะ
+                if not board and hasVIP then
+                    status = ("Auto Vote: บังคับแมพเป็น %s"):format(wantMap)
+                    local ok, err = pcall(cmdOverrideMap, wantMap)
+                    vlog(ok and ("ส่งคำสั่งบังคับแมพเป็น %s แล้ว"):format(wantMap)
+                            or  ("ส่งคำสั่งบังคับแมพไม่สำเร็จ: " .. tostring(err)))
+
+                    local until_ = os.clock() + 8
+                    while autoVote and os.clock() < until_ do
+                        board = findMapBoard(wantMap)
+                        if board then break end
+                        task.wait(0.3)
+                    end
+                end
+
+                if not board then
+                    --  บอกด้วยว่าตอนนี้กระดานทั้งสี่เป็นแมพอะไรบ้าง
+                    --  ถ้าชื่อในช่องเลือกสะกดไม่ตรงกับบนกระดาน จะเห็นทันทีตรงนี้
+                    local names = {}
+                    local lb = lobbyFolder()
+                    local bs = lb and lb:FindFirstChild("Boards")
+                    for _, b in ipairs(bs and bs:GetChildren() or {}) do
+                        table.insert(names, ("%s=%s"):format(b.Name, tostring(boardMapTitle(b))))
+                    end
+
+                    status = hasVIP
+                        and ("Auto Vote: บังคับ %s ไม่สำเร็จ — กระดานไม่เปลี่ยน"):format(wantMap)
+                        or  ("Auto Vote: ไม่มี %s บนกระดาน และไม่มี VIP ให้บังคับ"):format(wantMap)
+                    vlog("หา %q บนกระดานไม่เจอ | ตอนนี้: %s",
+                        wantMap, table.concat(names, "  "))
+                    task.wait(5)
+
+                else
+                    local prompt, att = boardVotePrompt(board)
+                    local pos = att and (att:IsA("Attachment") and att.WorldPosition or att.Position)
+                    local before = boardVoteCount(board) or 0
+
+                    vlog("%s อยู่ที่ %s (โหวตตอนนี้ %d) แท่นโหวต %s",
+                        wantMap, board.Name, before,
+                        pos and "เจอแล้ว" or "ไม่เจอ")
+
+                    --  ยิงคำสั่งโหวตตรงๆ ก่อน โดยไม่ต้องเดินไปไหน
+                    --
+                    --  คำสั่งพกตำแหน่งแท่นไปเองอยู่แล้ว (อ่านจาก Attachment ของกระดานนั้น)
+                    --  จึงไม่จำเป็นต้องพาตัวละครไปยืนตรงนั้นให้เสียเวลา
+                    --  ถ้าเซิร์ฟเวอร์ตรวจระยะจริง ตัวนับจะไม่ขึ้น แล้วค่อยเดินไปลองใหม่
+                    --  ให้ของจริงเป็นคนตอบว่าต้องเดินไหม ดีกว่าเดินไว้ก่อนทุกครั้งเผื่อจำเป็น
+                    status = ("Auto Vote: โหวต %s ที่ %s"):format(wantMap, board.Name)
+                    if pos then pcall(cmdVoteMap, wantMap, pos) end
+                    task.wait(1.5)
+
+                    --  ไม่ขึ้น = อาจต้องยืนใกล้จริง เดินไปแล้วลองอีกรอบ
+                    if (boardVoteCount(board) or 0) <= before and pos then
+                        vlog("โหวตระยะไกลไม่ติด — เดินไปที่แท่นแล้วลองใหม่")
+                        status = ("Auto Vote: เดินไปโหวตที่ %s"):format(board.Name)
+                        walkTo(pos, 20)
+
+                        if firePrompt and prompt then pcall(firePrompt, prompt) end
+                        pcall(cmdVoteMap, wantMap, pos)
+                        task.wait(1.5)
+                    end
+                    vlog("โหวตแล้ว ตัวนับ %d → %d %s", before, boardVoteCount(board) or -1,
+                        (boardVoteCount(board) or 0) > before and "(ไม่ต้องเดินเลย)" or "")
+
+                    --  กด Ready แล้วรอโหลดแมพ
+                    status = ("Auto Vote: โหวต %s แล้ว — กด Ready"):format(wantMap)
+                    local okR, errR = pcall(cmdLobbyReady)
+                    vlog(okR and "กด Ready แล้ว — รอโหลดแมพ"
+                             or ("กด Ready ไม่สำเร็จ: " .. tostring(errR)))
+
+                    --  ทำครบแล้ว ปักธงไว้ รอบนี้ไม่ต้องทำอะไรอีก
+                    votedThisRound = true
+                end
+            end
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════════════
+--  UI  (WindUI)
+-- ═══════════════════════════════════════════════════
+WindUI = loadstring(game:HttpGet(
+    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+WindUI:AddTheme({
+    Name = "Shadow X Hub",
+    Accent = Color3.fromHex("#040450"), Background = Color3.fromHex("#031638"),
+    Outline = Color3.fromHex("#090964"), Text = Color3.fromHex("#ffffff"),
+    Placeholder = Color3.fromHex("#09246e"), Button = Color3.fromHex("#08368b"),
+    Icon = Color3.fromHex("#9e9e9e"),
+})
+WindUI:AddTheme({
+    Name = "Dark",
+    Accent = Color3.fromHex("#18181b"), Background = Color3.fromHex("#101010"),
+    Outline = Color3.fromHex("#3f4046"), Text = Color3.fromHex("#ffffff"),
+    Placeholder = Color3.fromHex("#7a7a7a"), Button = Color3.fromHex("#52525b"),
+    Icon = Color3.fromHex("#a1a1aa"),
+})
+WindUI:AddTheme({
+    Name = "Darker",
+    Accent = Color3.fromHex("#000000"), Background = Color3.fromHex("#000000"),
+    Outline = Color3.fromHex("#3f3f46"), Text = Color3.fromHex("#ffffff"),
+    Placeholder = Color3.fromHex("#7a7a7a"), Button = Color3.fromHex("#2f2f31"),
+    Icon = Color3.fromHex("#a1a1aa"),
+})
+WindUI:AddTheme({
+    Name = "Light",
+    Accent = Color3.fromHex("#e4e4e7"), Background = Color3.fromHex("#f4f4f5"),
+    Outline = Color3.fromHex("#d4d4d8"), Text = Color3.fromHex("#18181b"),
+    Placeholder = Color3.fromHex("#71717a"), Button = Color3.fromHex("#d4d4d8"),
+    Icon = Color3.fromHex("#52525b"),
+})
+WindUI:AddTheme({
+    Name = "Midnight",
+    Accent = Color3.fromHex("#0f172a"), Background = Color3.fromHex("#0a0f1e"),
+    Outline = Color3.fromHex("#1e3a5f"), Text = Color3.fromHex("#e2e8f0"),
+    Placeholder = Color3.fromHex("#475569"), Button = Color3.fromHex("#1e293b"),
+    Icon = Color3.fromHex("#7dd3fc"),
+})
+WindUI:AddTheme({
+    Name = "Rose",
+    Accent = Color3.fromHex("#3b0a1e"), Background = Color3.fromHex("#1a0510"),
+    Outline = Color3.fromHex("#831843"), Text = Color3.fromHex("#fce7f3"),
+    Placeholder = Color3.fromHex("#9d4e6a"), Button = Color3.fromHex("#500724"),
+    Icon = Color3.fromHex("#f9a8d4"),
+})
+WindUI:AddTheme({
+    Name = "Forest",
+    Accent = Color3.fromHex("#14532d"), Background = Color3.fromHex("#052e16"),
+    Outline = Color3.fromHex("#166534"), Text = Color3.fromHex("#dcfce7"),
+    Placeholder = Color3.fromHex("#4ade80"), Button = Color3.fromHex("#15803d"),
+    Icon = Color3.fromHex("#86efac"),
+})
+WindUI:AddTheme({
+    Name = "Ocean",
+    Accent = Color3.fromHex("#0c4a6e"), Background = Color3.fromHex("#082f49"),
+    Outline = Color3.fromHex("#0369a1"), Text = Color3.fromHex("#e0f2fe"),
+    Placeholder = Color3.fromHex("#38bdf8"), Button = Color3.fromHex("#075985"),
+    Icon = Color3.fromHex("#7dd3fc"),
+})
+WindUI:SetTheme("Shadow X Hub")
+
+WindUI:Localization({
+    Enabled = true,
+    Prefix  = "loc:",
+    DefaultLanguage = "en",
+    Translations = {
+        ["th"] = {
+            ["D_NEWNAME"] = "ตั้งชื่อมาโครที่จะสร้างใหม่",
+            ["D_CREATE"]  = "สร้างมาโครเปล่าแล้วเลือกให้อัตโนมัติ",
+            ["D_PICK"]    = "เลือกมาโครที่จะอัดหรือเล่น",
+            ["D_DEL"]     = "ลบมาโครที่เลือก",
+            ["D_REC"]     = "เปิดแล้วเล่นตามปกติ ทุกการวาง/อัปเกรด/เล็ง/ขาย/สกิล/ข้ามเวฟ จะถูกจด · ปิดแล้วบันทึกให้เอง",
+            ["D_PLAY"]    = "เล่นมาโครที่เลือก · เปิดค้างไว้จะเล่นซ้ำเมื่อขึ้นแมตช์ใหม่",
+            ["D_CHECK"]   = "เทียบโหลดเอาต์ตอนนี้กับตอนที่อัด",
+            ["D_WAVE"]    = "รอให้ถึงเวฟเดียวกับตอนอัดก่อนค่อยทำ",
+            ["D_TIMED"]   = "เปิด = เล่นตามจังหวะเวลาที่อัดไว้เป๊ะๆ · ปิด = ทำทันทีที่เงินพอ ไม่สนเวลา (ทนกว่าในกรณีทั่วไป)",
+            ["D_ABILITY"] = "แยกสกิลไปกดตามจังหวะในเวฟเหมือนตอนอัด ไม่รอคิว และไม่หน่วงคำสั่งอื่น · ปิด = กดตามลำดับคิวแบบเดิม",
+            ["D_AUTOBUFF"] = "วนกดบัฟ Commander เองไม่รู้จบ ไล่ทีละตัวตามลำดับที่วาง · รอให้บัฟตัวก่อนขึ้นจริงและหมดจริงก่อนเสมอ ไม่กดทับกัน · แยกสกิลบัฟออกจากสกิลเรียกรถถังให้เอง",
+            ["D_DELAY"]   = "หน่วงระหว่างคำสั่ง ยิ่งน้อยยิ่งเร็วแต่เสี่ยงกว่า",
+            ["D_TIMEOUT"] = "คำสั่งเดียวลองซ้ำได้นานสุดกี่วินาที ครบแล้วข้ามไปคำสั่งถัดไป",
+            ["D_REPORT"]  = "คัดลอกสรุปคำสั่งที่ไม่สำเร็จของรอบล่าสุด พร้อมคำตอบจากเซิร์ฟเวอร์ วางส่งได้เลย",
+            ["D_KEY"]     = "ปุ่มเปิด/ปิดหน้าต่าง",
+            ["D_THEME"]   = "ธีมสี",
+            ["D_WALK"]    = "ให้ตัวละครเดินไปยืนตรงจุดที่มาโครวางทาวเวอร์ · เดินเฉพาะตอนเปลี่ยนชนิด วางชนิดเดิมซ้ำก็ยืนที่เดิม · เป็นแค่ภาพประกอบ ไม่ทำให้มาโครช้าลงแม้แต่วินาทีเดียว",
+            ["D_MAPPICK"] = "ด่านที่จะโหวต · เลือกมาโครแล้วช่องนี้จะเด้งตามด่านของมาโครให้เอง · บังคับด่านเองได้เฉพาะคนมีเกมพาส VIP",
+            ["D_MAPREF"]  = "โหลดรายชื่อด่านใหม่จากตัวเกม",
+            ["D_AUTOVOTE"] = "โหวตด่านที่เลือกแล้วกดพร้อมเล่นให้เอง · เข้าด่านแล้วจะหยุดเอง แล้วกลับมาทำใหม่รอบหน้าที่ออกมาห้องเลือกด่าน · เปิดค้างไว้ได้ตลอดสำหรับ AFK",
+            ["D_AGAIN"]   = "เกมจบแล้วกด Play Again ให้เอง ซึ่งพาไปเซิร์ฟเวอร์ใหม่แล้วเริ่มวงจรใหม่ทั้งหมด · ตัวนี้คือตัวที่ทำให้ AFK วนได้ไม่จบ",
+            ["D_TOLOBBY"] = "กลับล็อบบี้หลักเดี๋ยวนี้ · คนละที่กับห้องเลือกด่าน กดแล้วออกจากวงจร AFK ต้องเดินกลับเข้ามาเอง",
+        },
+        ["en"] = {
+            ["D_NEWNAME"] = "Name for the new macro",
+            ["D_CREATE"]  = "Create an empty macro and select it",
+            ["D_PICK"]    = "Pick the macro to record into or play",
+            ["D_DEL"]     = "Delete the selected macro",
+            ["D_REC"]     = "Turn on and play normally — everything is recorded; saves on turn off",
+            ["D_PLAY"]    = "Play the selected macro · leave on to replay each new match",
+            ["D_CHECK"]   = "Compare the current loadout against the recorded one",
+            ["D_WAVE"]    = "Wait for the same wave as when recorded",
+            ["D_TIMED"]   = "On = follow the exact timing of the recording · Off = act as soon as there is enough cash (more robust)",
+            ["D_ABILITY"] = "Fire abilities at their recorded moment within the wave, in parallel, without delaying other commands",
+            ["D_AUTOBUFF"] = "Endlessly rotate the Commander buff, waiting for each buff to truly start and end before the next",
+            ["D_DELAY"]   = "Delay between commands — lower is faster but riskier",
+            ["D_TIMEOUT"] = "How long one command may keep retrying before it is skipped",
+            ["D_REPORT"]  = "Copy a report of the commands that failed last run, with the server reply",
+            ["D_KEY"]     = "Key that shows / hides the window",
+            ["D_THEME"]   = "Color theme",
+            ["D_WALK"]    = "Walk your character to each tower the macro places · only when the tower type changes · purely cosmetic, the macro never waits for it",
+            ["D_MAPPICK"] = "Map to vote for · picking a macro sets this to that macro's map · forcing a map needs the VIP game pass",
+            ["D_MAPREF"]  = "Reload the map list from the game",
+            ["D_AUTOVOTE"] = "Vote for the chosen map and press Ready · stops once you are in the map, resumes next time you are back in the lobby · safe to leave on for AFK",
+            ["D_AGAIN"]   = "Press Play Again when a match ends — this moves you to a fresh server and restarts the whole cycle · this is what keeps AFK going",
+            ["D_TOLOBBY"] = "Go back to the main lobby now · that is not the map-select lobby; this leaves the AFK cycle",
+        },
+    },
+})
+
+local Window = WindUI:CreateWindow({
+    Title  = "Tower Defense Simulator",
+    Icon   = "rbxassetid://118253533466049",
+    Author = "by Shadow X Hub",
+    Folder = "ShadowXHub/TDS",
+
+    Size                        = UDim2.fromOffset(200, 300),
+    MinSize                     = Vector2.new(560, 360),
+    MaxSize                     = Vector2.new(850, 600),
+    ToggleKey                   = Enum.KeyCode.Z,
+    Transparent                 = true,
+    Resizable                   = true,
+    SideBarWidth                = 200,
+    BackgroundImageTransparency = 0.5,
+    HideSearchBar               = true,
+    ScrollBarEnabled            = false,
+
+    User = { Enabled = true, Anonymous = true, Callback = function() end },
+})
+
+Window:EditOpenButton({
+    Title           = "Tower Defense Simulator",
+    Icon            = "monitor",
+    CornerRadius    = UDim.new(0, 16),
+    StrokeThickness = 2,
+    Color           = ColorSequence.new(
+        Color3.fromHex("#016fec"),
+        Color3.fromHex("#1100ff")
+    ),
+    OnlyMobile = false,
+    Enabled    = true,
+    Draggable  = true,
+})
+
+-- ────────────────────────────────────────────────
+--  TAB : Main
+-- ────────────────────────────────────────────────
+local MainTab = Window:Tab({ Title = "Main", Icon = "house", Locked = false })
+MainTab:Select()
+
+-- ── Map ──
+local SectionMap = MainTab:Section({ 
+    Title = "Map vote(need VIP!)",
+    Box = false,
+    Opened = true,
+})
+
+MapDropdown = SectionMap:Dropdown({
+    Title = "Select Map",
+    Desc = "loc:D_MAPPICK",
+    Values = listMapNames(),
+    Value = nil,
+    Callback = function(option)
+        --  Dropdown แบบเลือกได้หลายอันจะส่ง table มา ไม่ใช่ข้อความ
+        --  ถ้าต่อสตริงตรงๆ จะพังทันทีที่เปลี่ยนเป็น Multi ทีหลัง
+        wantMap = (type(option) == "table") and option[1] or option
+        if type(wantMap) ~= "string" then wantMap = "" end
+    end
+})
+
+local RemapButton = SectionMap:Button({
+    Title = "Refresh list map",
+    Desc = "loc:D_MAPREF",
+    Locked = false,
+    Callback = function()
+        pcall(function() MapDropdown:Refresh(listMapNames()) end)
+    end
+})
+
+local MapToggle = SectionMap:Toggle({
+    Title = "Auto Vote map",
+    Desc = "loc:D_AUTOVOTE",
+    Icon = "map",
+    Type = "Checkbox",
+    Value = false, -- default value
+    Callback = function(state)
+        autoVote = state and true or false
+        vlog(autoVote and "สวิตช์เปิดแล้ว — เริ่มลูป" or "สวิตช์ปิดแล้ว")
+        if autoVote then autoVoteLoop() end
+    end
+})
+
+--  ไม่ล็อกสวิตช์อีกแล้ว
+--
+--  เดิมล็อกไว้จนกว่าจะเช็คว่ามี VIP แล้วค่อยปลดล็อก ซึ่งเป็นทางตันที่เงียบสนิท:
+--  ถ้าปลดล็อกไม่สำเร็จด้วยเหตุใดก็ตาม สวิตช์จะกดไม่ติดโดยไม่มีอะไรบอกเลย
+--  ผู้ใช้เห็นแค่ "กดแล้วไม่มีอะไรเกิดขึ้น" ซึ่งหน้าตาเหมือนบั๊กอีกสิบแบบ
+--
+--  และการล็อกก็ไม่จำเป็นด้วย — คนไม่มี VIP ยังใช้ประโยชน์ได้:
+--  บังคับแมพไม่ได้ก็จริง แต่ถ้าแมพที่เลือกบังเอิญขึ้นกระดานเอง มันจะโหวตให้แล้วกด Ready
+--  ตอนนี้จึงเปิดให้กดได้เสมอ แล้วไปบอกสถานะ VIP ที่คำอธิบายแทน
+task.spawn(function()
+    --  ลองซ้ำได้ การเช็คเกมพาสเป็นการเรียกผ่านเน็ต พลาดชั่วคราวได้เสมอ
+    local owns, err
+    for i = 1, 3 do
+        local ok, res = pcall(function()
+            return MarketplaceService:UserOwnsGamePassAsync(LocalPlayer.UserId, VIP_GAMEPASS)
+        end)
+        if ok then owns = res break end
+        err = res
+        vlog("เช็คเกมพาส VIP ไม่สำเร็จ (ครั้งที่ %d): %s", i, tostring(res))
+        task.wait(2)
+    end
+
+    hasVIP = owns and true or false
+    vlog(hasVIP and "มีเกมพาส VIP — บังคับแมพเองได้"
+                or  ("ไม่มีเกมพาส VIP (%s) — โหวตได้เฉพาะแมพที่ขึ้นกระดานเอง")
+                    :format(tostring(err)))
+
+    --  ไม่มี VIP ก็ยังใช้ได้ แค่บังคับด่านไม่ได้ — บอกให้ชัดจะได้ไม่เข้าใจผิดว่าพัง
+    if not hasVIP then
+        pcall(function()
+            MapToggle:SetDesc("No VIP — can only vote for maps already on the boards")
+        end)
+    end
+end)
+
+-- ── Match ──
+local SectionMatch = MainTab:Section({
+    Title = "Match",
+    Box = false,
+    Opened = true,
+})
+
+local AgainToggle = SectionMatch:Toggle({
+    Title = "Auto Play Again",
+    Desc  = "loc:D_AGAIN",
+    Icon  = "rotate-ccw",
+    Type  = "Checkbox",
+    Value = false,
+    Callback = function(state)
+        autoAgain = state and true or false
+        vlog(autoAgain and "เปิดกด Play Again อัตโนมัติ" or "ปิดกด Play Again อัตโนมัติ")
+    end,
+})
+
+--  ตัวนี้เป็นปุ่มกดครั้งเดียว ไม่ใช่สวิตช์
+--  เพราะมันพาออกจากวงจร AFK ทันที ทำเป็นสวิตช์ค้างไว้จะยิ่งเสี่ยงกดค้างโดยไม่ตั้งใจ
+SectionMatch:Button({
+    Title = "Return to Lobby",
+    Desc  = "loc:D_TOLOBBY",
+    Icon  = "log-out",
+    Callback = function()
+        local ok, err = pcall(cmdBackToLobby)
+        vlog(ok and "ส่งคำสั่งกลับล็อบบี้หลักแล้ว"
+                or  ("กลับล็อบบี้หลักไม่สำเร็จ: " .. tostring(err)))
+    end,
+})
+
+-- ────────────────────────────────────────────────
+--  TAB : MACRO
+-- ────────────────────────────────────────────────
+local MacroTab = Window:Tab({ Title = "Macro", Icon = "circle-dot", Locked = false })
+
+-- ── Stats ──
+MacroTab:Section({ Title = "Stats" })
+
+local StatsPara = MacroTab:Paragraph({ Title = "Status", Desc = "..." })
+
+task.spawn(function()
+    while true do
+        pcall(function()
+            local cash = getCash()
+            local hp, hpMax = getHealth()
+            StatsPara:SetDesc(T("STATS",
+                    status,
+                    getWave(),
+                    cash and ("$" .. cash) or T("NO_CASH_READ"),
+                    hp, hpMax,
+                    myTowerCount(),
+                    currentName ~= "" and currentName or T("NONE_SEL"),
+                    macro and #macro.actions or 0,
+                    loadoutMsg ~= "" and ("\n" .. loadoutMsg) or "",
+                    lastError ~= "" and ("\n⚠ " .. lastError) or ""))
+        end)
+        task.wait(0.4)
+    end
+end)
+
+-- ── สร้างมาโคร ──
+MacroTab:Section({ Title = "Create Macro" })
+
+local MacroDropdown     -- ประกาศก่อน ปุ่มสร้างต้องเรียกรีเฟรช
+
+local NameInput = MacroTab:Input({
+    Title = "New Macro Name",
+    Desc  = "loc:D_NEWNAME",
+    Flag  = "NewMacroName",
+    Icon  = "type",
+    Value = "Macro 1",
+    Placeholder = "Macro 1",
+    Callback = function(v) newName = safeName(v) end,
+})
+
+MacroTab:Button({
+    Title = "Create Macro",
+    Desc  = "loc:D_CREATE",
+    Icon  = "plus",
+    Callback = function()
+        if recording or playing then
+            status = T("BUSY")
+            return
+        end
+
+        local n = safeName(newName)
+        if isfile(macroPath(n)) then
+            status = T("NAME_TAKEN", n)
+            return
+        end
+
+        macro = newMacro(n)
+        if not writeMacro(macro) then
+            status = T("CREATE_FAIL")
+            return
+        end
+
+        currentName = n
+        loadoutMsg  = ""
+
+        --  Set จะไปกระตุ้น Callback ของ dropdown ซึ่งเขียน status ทับ
+        --  จึงต้องตั้ง status หลังจากนั้น ไม่ใช่ก่อน
+        pcall(function()
+            MacroDropdown:Refresh(listMacros())
+            MacroDropdown:Set(n)
+        end)
+
+        status = T("CREATED", n)
+    end,
+})
+
+-- ── เลือกมาโคร ──
+MacroTab:Section({ Title = "Select Macro" })
+
+MacroDropdown = MacroTab:Dropdown({
+    Title  = "Saved Macros",
+    Desc   = "loc:D_PICK",
+    Values = listMacros(),
+    Value  = nil,
+    Callback = function(v)
+        if not v or v == EMPTY_LIST then return end
+        if recording or playing then
+            status = T("BUSY_SWITCH")
+            return
+        end
+        loadoutMsg = ""
+        loadMacro(v)
+    end,
+})
+
+MacroTab:Button({
+    Title = "Refresh List",
+    Icon  = "refresh-cw",
+    Callback = function()
+        pcall(function() MacroDropdown:Refresh(listMacros()) end)
+    end,
+})
+
+MacroTab:Button({
+    Title = "Delete Selected Macro",
+    Desc  = "loc:D_DEL",
+    Icon  = "trash-2",
+    Callback = function()
+        if recording or playing then status = T("BUSY") return end
+        if currentName == "" then status = T("NO_MACRO") return end
+        if deleteMacro(currentName) then
+            pcall(function() MacroDropdown:Refresh(listMacros()) end)
+        end
+    end,
+})
+
+-- ── อัด / เล่น ──
+MacroTab:Section({ Title = "Record / Play" })
+
+--  ยืนยันอัดทับแล้ว รอบถัดไปที่สวิตช์ถูกเปิดจะไม่ถามซ้ำ
+local confirmRec = false
+
+RecordToggle = MacroTab:Toggle({
+    Title = "Record Macro",
+    Desc  = "loc:D_REC",
+    Flag  = "Recording",
+    Icon  = "circle-dot",
+    Type  = "Checkbox",
+    Value = false,
+    Callback = function(v)
+        if not v then
+            task.spawn(stopRecording)
+            return
+        end
+
+        local function begin()
+            if not startRecording() then
+                task.defer(function() pcall(function() RecordToggle:Set(false) end) end)
+            end
+        end
+
+        --  มาโครที่มีคำสั่งอยู่แล้ว การอัดใหม่จะเขียนทับทิ้งทั้งหมด ต้องถามก่อน
+        if macro and #macro.actions > 0 and not confirmRec then
+            --  ปิดสวิตช์กลับทันที ไม่ให้ค้างเป็นเปิดระหว่างรอคำตอบ
+            task.defer(function() pcall(function() RecordToggle:Set(false) end) end)
+
+            WindUI:Popup({
+                Title   = T("RE_TITLE"),
+                Icon    = "circle-alert",
+                Content = T("RE_BODY", macro.name or currentName, #macro.actions),
+                Buttons = {
+                    {
+                        Title    = T("BTN_CANCEL"),
+                        Variant  = "Tertiary",
+                        Callback = function() end,   -- สวิตช์ถูกปิดไปแล้ว
+                    },
+                    {
+                        Title    = T("BTN_REC"),
+                        Icon     = "circle-dot",
+                        Variant  = "Primary",
+                        Callback = function()
+                            --  ธงกันวน: การเปิดสวิตช์ใหม่จะวิ่งเข้า callback นี้อีกรอบ
+                            --  ถ้าไม่มีธง popup จะเด้งซ้ำไม่จบ
+                            confirmRec = true
+                            pcall(function() RecordToggle:Set(true) end)
+                        end,
+                    },
+                },
+            })
+            return
+        end
+
+        confirmRec = false
+        begin()
+    end,
+})
+
+local PlayToggle
+PlayToggle = MacroTab:Toggle({
+    Title = "Play Macro",
+    Desc  = "loc:D_PLAY",
+    Flag  = "Playing",
+    Icon  = "play",
+    Type  = "Checkbox",
+    Value = false,
+    Callback = function(v)
+        --  สวิตช์นี้แปลว่า "อยากให้เล่น" ไม่ใช่ "กำลังเล่นอยู่ตอนนี้"
+        --
+        --  ของเดิมพอ startPlaying() ไม่ผ่านก็ปิดสวิตช์ตัวเองทิ้ง
+        --  ซึ่งพังกับ AFK เต็มๆ: เข้าเกมใหม่ กว่ารายชื่อมาโครจะโหลดเสร็จก็ผ่านไปหลายวินาที
+        --  ระหว่างนั้นยังไม่มีมาโครถูกเลือก สวิตช์เลยเด้งปิด
+        --  แล้วพอมาโครโหลดเสร็จจริงๆ ก็ไม่มีใครกลับมาเปิดให้ — AFK จบตรงนั้น
+        --
+        --  ตอนนี้เปิดค้างไว้ได้เลย ตัวเฝ้าข้างล่างจะคอยลองเริ่มให้เองเมื่อพร้อม
+        wantPlay = v and true or false
+        if wantPlay then
+            startPlaying()
+        else
+            stopPlaying()
+        end
+    end,
+})
+
+MacroTab:Button({
+    Title = "Check Loadout",
+    Desc  = "loc:D_CHECK",
+    Icon  = "list-checks",
+    Callback = function()
+        local ok, msg = checkLoadout()
+        loadoutMsg = msg
+        pcall(function()
+            WindUI:Notify({
+                Title = ok and "Loadout OK" or "Loadout Mismatch",
+                Content = msg, Duration = 8,
+                Icon = ok and "check" or "triangle-alert",
+            })
+        end)
+    end,
+})
+
+-- ── Setting macro ──
+MacroTab:Section({ Title = "Setting macro" })
+
+local WaveToggle = MacroTab:Toggle({
+    Title = "Wait for Wave",
+    Desc  = "loc:D_WAVE",
+    Flag  = "WaveGate",
+    Type  = "Checkbox",
+    Value = true,
+    Callback = function(v) waveGate = v end,
+})
+
+AutoBuffToggle = MacroTab:Toggle({
+    Title = "Auto Buff Commander",
+    Desc  = "loc:D_AUTOBUFF",
+    Flag  = "AutoBuff",
+    Icon  = "repeat",
+    Type  = "Checkbox",
+    Value = false,
+    Callback = function(v)
+        if not v then
+            autoBuff = false
+            status = T("AUTOBUFF_OFF")
+            return
+        end
+
+        --  หาชนิดที่จะหมุน — ของในสนามมาก่อน แล้วค่อยดูจากมาโคร
+        --  Commander มาก่อนเสมอเพราะเป็นทาวเวอร์บัฟที่ใช้กันมากที่สุด
+        --  ตัวลูปจะเลือกใหม่ให้เองทุกรอบด้วย ตรงนี้แค่หาค่าเริ่มต้น
+        buffKind = resolveBuffKind()
+
+        --  ยังไม่เจออะไรเลยก็ยังเปิดได้ ลูปจะไปหาเองเมื่อมีทาวเวอร์ลงสนาม
+        --  ของเดิมปิดสวิตช์กลับทันที ทำให้เปิดค้างรอไว้ก่อนวางทาวเวอร์ไม่ได้
+        if buffKind == "" then
+            status = T("NO_ABILITY")
+        end
+
+        --  ล้างสิ่งที่เคยสรุปไว้ทุกครั้งที่เปิดใหม่
+        --  ถ้าเคยตัดสินผิดว่าสกิลไหนไม่ใช่บัฟ การปิดเปิดใหม่ต้องแก้ได้
+        notBuff, buffMiss = {}, {}
+
+        autoBuff = true
+        if buffKind ~= "" then status = T("AUTOBUFF_ON", buffKind) end
+
+        --  จดลงมาโครทันทีที่เปิด ไม่รอตอนหยุดอัด
+        --
+        --  ผู้ใช้เกือบจะต้องเปิดกลางการอัดเสมอ เพราะสวิตช์นี้หาชนิดจากทาวเวอร์
+        --  ที่อยู่ในสนาม ตอนกดเริ่มอัดสนามยังว่าง กดตอนนั้นจะไม่ผ่านด้วยซ้ำ
+        --  จดทันทีแล้วต่อให้เกมหลุดกลางคัน ค่านี้ก็ยังติดไปกับไฟล์
+        if recording then stampAutoBuff() end
+
+        autoBuffLoop()
+    end,
+})
+
+local AbilityToggle = MacroTab:Toggle({
+    Title = "Ability Timing",
+    Desc  = "loc:D_ABILITY",
+    Flag  = "AbilityTiming",
+    Type  = "Checkbox",
+    Value = true,
+    Callback = function(v) abilityTiming = v end,
+})
+
+local TimedToggle = MacroTab:Toggle({
+    Title = "Replay Original Timing",
+    Desc  = "loc:D_TIMED",
+    Flag  = "TimedPlay",
+    Type  = "Checkbox",
+    Value = false,
+    Callback = function(v) timedPlay = v end,
+})
+
+local DelaySlider = MacroTab:Slider({
+    Title = "Command Delay",
+    Desc  = "loc:D_DELAY",
+    Flag  = "CmdDelay",
+    Step  = 0.05,
+    Value = { Min = 0.10, Max = 3, Default = 0.50 },
+    Callback = function(v) cmdDelay = tonumber(v) or 0.5 end,
+})
+
+local TimeoutSlider = MacroTab:Slider({
+    Title = "Retry Timeout",
+    Desc  = "loc:D_TIMEOUT",
+    Flag  = "ActionTimeout",
+    Step  = 5,
+    Value = { Min = 5, Max = 180, Default = 45 },
+    Callback = function(v) actionTimeout = tonumber(v) or 45 end,
+})
+
+MacroTab:Button({
+    Title = "Copy Last Run Report",
+    Desc  = "loc:D_REPORT",
+    Icon  = "clipboard-list",
+    Callback = function()
+        local text = failSummary()
+
+        --  ก๊อปลงคลิปบอร์ดเป็นหลัก เขียนไฟล์เป็นตัวสำรอง
+        --  ผู้ใช้ส่วนใหญ่หาโฟลเดอร์ของ executor ไม่เจอ แต่วางในแชตได้ทันที
+        local copied = false
+        if setclipboard then copied = pcall(setclipboard, text) end
+        if writefile then pcall(writefile, "TDS_report.txt", text) end
+        saveLog()
+
+        status = copied and T("REPORT_COPIED", #failLog) or T("REPORT_FAIL")
+        pcall(function()
+            WindUI:Notify({
+                Title    = "Last Run Report",
+                Content  = text,
+                Duration = 12,
+                Icon     = #failLog == 0 and "check" or "triangle-alert",
+            })
+        end)
+    end,
+})
+
+Window:Divider()
+
+-- ═══════════════════════════════════════════════════
+--  SETTING TAB
+-- ═══════════════════════════════════════════════════
+local SettingTab = Window:Tab({ Title = "Setting", Icon = "settings", Locked = false })
+SettingTab:Section({ Title = "Settings" })
+
+local WalkToggle = SettingTab:Toggle({
+    Title = "Walk Around",
+    Desc  = "loc:D_WALK",
+    Icon  = "footprints",
+    Type  = "Checkbox",
+    Value = false,
+    Callback = function(state)
+        walkAround = state and true or false
+    end,
+})
+
+local Keybind = SettingTab:Keybind({
+    Title = "Keybind",
+    Desc  = "loc:D_KEY",
+    Flag  = "UIKeybind",
+    Value = "Z",
+    Callback = function(v)
+        Window:SetToggleKey(Enum.KeyCode[v])
+    end
+})
+
+SettingTab:Section({ Title = "Appearance" })
+
+local UIThemeDropdown = SettingTab:Dropdown({
+    Title    = "UI Theme",
+    Desc     = "loc:D_THEME",
+    Flag     = "UITheme",
+    Values   = { "Shadow X Hub", "Dark", "Darker", "Light", "Midnight", "Rose", "Forest", "Ocean" },
+    Value    = "Shadow X Hub",
+    Callback = function(sel)
+        pcall(function() WindUI:SetTheme(sel) end)
+    end,
+})
+
+-- ═══════════════════════════════════════════════════
+--  CONFIG — Save & Auto-Load
+--  ไม่บันทึกสวิตช์อัด/เล่น — ไม่ควรทำงานเองทันทีที่โหลดสคริปต์
+-- ═══════════════════════════════════════════════════
+local ConfigManager = Window.ConfigManager
+local myConfig = ConfigManager:CreateConfig("config")
+
+myConfig:Register("NewMacroName",  NameInput)
+myConfig:Register("WaveGate",      WaveToggle)
+myConfig:Register("TimedPlay",     TimedToggle)
+myConfig:Register("AbilityTiming", AbilityToggle)
+myConfig:Register("AutoBuff",      AutoBuffToggle)
+myConfig:Register("CmdDelay",      DelaySlider)
+myConfig:Register("ActionTimeout", TimeoutSlider)
+myConfig:Register("UIKeybind",     Keybind)
+myConfig:Register("UITheme",       UIThemeDropdown)
+myConfig:Register("WalkAround",    WalkToggle)
+
+--  จำมาโครที่เลือกไว้ด้วย
+--
+--  ไม่จำแล้วเปิดสคริปต์ใหม่ทุกครั้งจะไม่มีมาโครถูกเลือก พอกดเล่นก็เด้ง
+--  "เลือกมาโครที่มีคำสั่งก่อน" แล้วสวิตช์ก็ปิดตัวเอง — AFK ข้ามรอบไม่ได้เลย
+--  ต้องนั่งเลือกใหม่ด้วยมือทุกครั้งที่เข้าเกม ซึ่งขัดกับจุดประสงค์ทั้งหมด
+myConfig:Register("MacroPick",     MacroDropdown)
+
+--  แท็บ Main ก็ต้องจำด้วย ไม่งั้นเปิดเกมใหม่ต้องมาตั้งค่าใหม่ทุกครั้ง
+--  ซึ่งขัดกับ AFK ทั้งหมด — จุดประสงค์คือเปิดทิ้งไว้แล้วมันทำเอง
+myConfig:Register("MapPick",       MapDropdown)
+myConfig:Register("AutoVoteMap",   MapToggle)
+myConfig:Register("AutoPlayAgain", AgainToggle)
+
+--  จำสวิตช์เล่นด้วย
+--
+--  เดิมตั้งใจไม่จำ ด้วยเหตุผลว่า "ไม่ควรทำงานเองทันทีที่โหลดสคริปต์"
+--  ซึ่งถูกตอนที่ยังไม่มีระบบ AFK แต่ตอนนี้เหตุผลกลับด้าน:
+--  เข้าเกมใหม่แล้วต้องมากดเองทุกครั้ง = AFK ข้ามรอบไม่ได้เลย
+--  และมันก็ไม่ได้เริ่มทันทีอยู่ดี ตัวเฝ้าจะรอจนเลือกมาโครและเข้าด่านถูกก่อนเสมอ
+myConfig:Register("PlayMacro",     PlayToggle)
+
+task.spawn(function()
+    task.wait(0)
+    pcall(function() DelaySlider:Set(0.50) end)
+    pcall(function() TimeoutSlider:Set(45) end)
+
+    --  เติมรายชื่อก่อนโหลดค่าที่บันทึกไว้
+    --  ถ้ารายการยังว่าง ค่าที่โหลดมาจะไม่มีตัวเลือกให้ตรง แล้วมันจะทิ้งค่านั้นไป
+    pcall(function() MacroDropdown:Refresh(listMacros()) end)
+
+    pcall(function() myConfig:Load() end)
+
+    if not cmdDelay      or cmdDelay      <= 0 then cmdDelay      = 0.5 end
+    if not actionTimeout or actionTimeout <  5 then actionTimeout = 45  end
+
+    --  โหลดไฟล์มาโครตามชื่อที่เพิ่งกู้คืนมา
+    --
+    --  บาง element ของ WindUI ตั้งค่าให้เฉยๆ โดยไม่เรียก Callback
+    --  ถ้าพึ่ง Callback อย่างเดียว ช่องจะโชว์ชื่อมาโครแต่ข้างในยังว่าง
+    --  ซึ่งเป็นอาการที่หลอกที่สุด เพราะดูเหมือนเลือกไว้แล้วแต่กดเล่นไม่ได้
+    task.delay(1, function()
+        local pick = currentName
+        if pick == "" then
+            local ok, v = pcall(function() return MacroDropdown.Value end)
+            if ok and type(v) == "string" then pick = v end
+        end
+        if pick ~= "" and pick ~= EMPTY_LIST and currentName ~= pick then
+            pcall(loadMacro, pick)
+        end
+    end)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(10)
+        pcall(function() myConfig:Save() end)
+    end
+end)
+
+--  ตัวเฝ้าสวิตช์เล่น — หัวใจของการ AFK
+--
+--  หน้าที่สองอย่าง
+--    1. สวิตช์ปิดอยู่แต่ตัวเล่นยังทำงาน → ไม่มี (stopPlaying จัดการแล้ว)
+--    2. สวิตช์เปิดอยู่แต่ตัวเล่นหยุดไป → ลองเริ่มใหม่ให้เอง
+--
+--  ข้อ 2 คือสิ่งที่หายไปตลอด ตัวเล่นหยุดได้จากหลายสาเหตุที่แก้เองได้ในไม่กี่วินาที
+--  เช่นยังไม่ได้เลือกมาโคร (รายชื่อยังโหลดไม่เสร็จ) หรือหลุดออกมาห้องเลือกด่าน
+--  ของเดิมเจอแบบนี้แล้วปิดสวิตช์ทิ้ง แล้ว AFK ก็จบลงเงียบๆ ตรงนั้น
+--
+--  ลองใหม่ทุก 3 วินาที ไม่ถี่กว่านี้เพราะ startPlaying มีการเช็คโหลดเอาต์อยู่ข้างใน
+task.spawn(function()
+    while true do
+        task.wait(3)
+
+        if wantPlay and not playing then
+            --  ต้องมีมาโครก่อน ไม่งั้นเรียกไปก็ได้แค่ข้อความเตือนเดิมซ้ำๆ
+            if macro and #macro.actions > 0 then
+                if startPlaying() then
+                    vlog("เปิดตัวเล่นให้อัตโนมัติ (สวิตช์เปิดค้างไว้อยู่)")
+                end
+            else
+                status = T("NEED_CMDS")
+            end
+        end
+
+        --  สวิตช์แสดงผลให้ตรงกับความตั้งใจเสมอ
+        --  ไม่ปิดตามตัวเล่นอีกแล้ว เพราะตัวเล่นหยุดชั่วคราวเป็นเรื่องปกติ
+        if not wantPlay and playing then
+            playing = false
+        end
+    end
+end)
+
+--  ป้ายบอกรุ่น — พิมพ์ทันทีที่โหลดเสร็จ ไม่ต้องกดอะไร
+--
+--  มีไว้ตอบคำถามเดียว: "ไฟล์ที่กำลังรันอยู่ มีโค้ดชุดใหม่หรือยัง"
+--  ที่ผ่านมาเราเสียเวลาไล่บั๊กที่อาจไม่มีอยู่จริง เพราะแยกไม่ออกระหว่าง
+--  "โค้ดผิด" กับ "โค้ดถูกแต่ยังไม่ได้เอาไปใช้" ซึ่งอาการเหมือนกันเป๊ะ
+vlog("โหลดสคริปต์เสร็จ · รุ่นนี้มีระบบโหวตแมพและตัวเช็คชื่อด่านแล้ว")
+
+status = inGame() and T("READY_IN") or T("READY_WAIT")
